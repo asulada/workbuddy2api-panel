@@ -100,16 +100,18 @@ func TestCampaignTasksMergesProgress(t *testing.T) {
 func TestCampaignTaskReady(t *testing.T) {
 	cases := []struct {
 		progress, target int
+		status           string
 		want             bool
 	}{
-		{3, 3, true},
-		{2, 3, false},
-		{0, 1, false},
-		{1, 1, true},
-		{5, 0, false}, // target 缺失（上游没下发）不算达标
+		{3, 3, "", true},
+		{2, 3, "", false},
+		{0, 1, "", false},
+		{1, 1, "done", true},
+		{5, 0, "", false},        // target 缺失（上游没下发）不算达标
+		{3, 3, "claimed", false}, // 已领过：不再 viewed + claim 一遍
 	}
 	for _, c := range cases {
-		got := CampaignTaskReady(CampaignTask{Progress: c.progress, Target: c.target})
+		got := CampaignTaskReady(CampaignTask{Progress: c.progress, Target: c.target, Status: c.status})
 		if got != c.want {
 			t.Fatalf("ready(%d/%d)=%v want %v", c.progress, c.target, got, c.want)
 		}
@@ -142,5 +144,54 @@ func TestCampaignTaskCodeIsPathEscaped(t *testing.T) {
 	}
 	if !strings.Contains(gotPath, "a%2Fb%20c") {
 		t.Fatalf("任务 code 未转义，可能拼出越界路径: %q", gotPath)
+	}
+}
+
+// TestCampaignBasePathShape 钉住路径形状：module 为空时不加模块段。
+//
+// 踩过一次：星巴克这期是 `/portal/activity/tasks`（无模块段），按「一定有模块段」
+// 拼成 `/portal/activity/campaign/tasks` 后上游照样回 200，但任务表是空的——
+// 表现为「活动没有任务」，很难看出是路径错了。
+func TestCampaignBasePathShape(t *testing.T) {
+	cases := []struct{ module, want string }{
+		{"", "/portal/activity"},
+		{"coffee", "/portal/activity/coffee"},
+		{"campaign", "/portal/activity/campaign"},
+	}
+	for _, tc := range cases {
+		if got := campaignBase(tc.module); got != tc.want {
+			t.Fatalf("campaignBase(%q)=%q want %q", tc.module, got, tc.want)
+		}
+	}
+}
+
+// TestCampaignRequestsUseModuleLessPath 端到端确认默认 module 的请求路径不带模块段。
+func TestCampaignRequestsUseModuleLessPath(t *testing.T) {
+	var paths []string
+	c := testClient(func(r *http.Request) (*http.Response, error) {
+		paths = append(paths, r.URL.Path)
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/config"):
+			return jsonResp(200, sbuxConfigBody), nil
+		case strings.HasSuffix(r.URL.Path, "/tasks"):
+			return jsonResp(200, sbuxTasksBody), nil
+		case strings.HasSuffix(r.URL.Path, "/vouchers"):
+			return jsonResp(200, sbuxVoucherBody), nil
+		}
+		return jsonResp(404, `{"code":404}`), nil
+	})
+	if _, err := c.CampaignTasks(&auth.Auth{UID: "u1", AccessToken: "at"}, "", "campaign_starbucks_2026"); err != nil {
+		t.Fatalf("CampaignTasks: %v", err)
+	}
+	for _, p := range paths {
+		if strings.Contains(p, "/portal/activity/campaign/") {
+			t.Fatalf("路径多了模块段: %q（应为 /portal/activity/...）", p)
+		}
+		if !strings.HasPrefix(p, "/portal/activity/") {
+			t.Fatalf("路径前缀不对: %q", p)
+		}
+	}
+	if len(paths) != 3 {
+		t.Fatalf("请求数=%d want 3 (config/tasks/vouchers)", len(paths))
 	}
 }

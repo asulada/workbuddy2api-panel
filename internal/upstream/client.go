@@ -47,7 +47,8 @@ const (
 	ErrContentBlocked                   // 内容策略拦截（400 + 审核文案）→ 不罚账号，走降级重试
 	ErrBadParams                        // 请求体解析失败（400 + Unmarshal chat params failed / 11101）→ 请求级错误：不罚号、不轮转，末端 400 透传原文
 	ErrAccountFault                     // 账号级授权/配额故障（11140 request illegal / 14017 trial not activated）→ 冷却轮换，不无限重试
-	ErrModelBlocked                     // 11102「该后端无此模型」→ (账号,模型) 负缓存避让，切模型/切账号
+	ErrModelBlocked                     // 11158「该账号类型无权使用该模型」→ (账号,模型) 负缓存避让，切到有权限的号
+	ErrModelMissing                     // 11102/14401「该模型 id 在上游不存在」→ 请求级错误：不罚号、不轮转，末端 400 透传原文
 	ErrWafBlock                         // 403 + 非业务信封体（APISIX WAF 拦截页/空体）→ 账号软冷却 + 抖动退避
 	ErrPromptTooLong                    // 11115「prompt is too long」→ 请求级错误（上下文超限是请求的问题非账号的问题）：不罚号、不轮转，末端透传原文
 	ErrImageInvalid                     // 图片请求格式/数据无效 → 请求级错误：不罚号、不轮转，末端透传原文
@@ -76,6 +77,8 @@ func (k ErrKind) String() string {
 		return "bad_params"
 	case ErrModelBlocked:
 		return "model_blocked"
+	case ErrModelMissing:
+		return "model_missing"
 	case ErrWafBlock:
 		return "waf_block"
 	case ErrPromptTooLong:
@@ -226,6 +229,32 @@ func isPromptTooLongStatus(status int) bool {
 // 网络层/解析层错误不在此识别（见 IsAlreadyCheckin）。
 var alreadyCheckinMarkers = []string{"已签到", "already"}
 var badParamsMarkerCode = `"code":11101`
+var badParamsMarkerFuncParams = `invalid function call parameters`
+var badParamsMarkerFuncParamsAlt = `invalid_function_parameters`
+
+// badParamsMarkers11129 11129「invalid function call parameters」（displayMsg「工具定义不合规」）的文案
+// 形态，已小写化，与 strings.ToLower(body) 比对；中文原文无大小写，同样可比。业务码 11129 不在这里：
+// 走 hasBusinessCode（见 isToolSchemaRejected），容忍空白、字符串形态与嵌套。
+var badParamsMarkers11129 = []string{
+	badParamsMarkerFuncParams,
+	badParamsMarkerFuncParamsAlt,
+	"invalid_function_call_parameters",
+	"工具定义不合规",
+}
+
+// isToolSchemaRejected 判定「工具定义被上游整体拒收」：11129（schema 形态不合规，
+// displayMsg「工具定义不合规」）与 11152（工具名不合规或重名，displayMsg「工具名称
+// 不规范」）都属同一类——错在客户端声明的 tools，换任何账号都是同一处拒绝。
+// 业务码精确命中（容忍空白/字符串形态/嵌套），或文案命中（首帧 error 帧里 message
+// 可能是英文原文、下划线形态或中文 displayMsg）。lower 须为 strings.ToLower(body)。
+//
+// 11152 是 2026-11-18 真机实测补进来的：工具名带点/冒号/斜杠/CJK/空格、或两个同名
+// 工具，上游一律 400 11152。此前未登记 → 落到 Classify 通用 4xx 兜底 → ErrClient →
+// 喂连败、轮转全池、末端 503 no_healthy_account，把一个确定性请求错误伪装成账号故障。
+func isToolSchemaRejected(body, lower string) bool {
+	return hasBusinessCode(body, "11129") || hasBusinessCode(body, "11152") ||
+		containsAnyMarker(lower, badParamsMarkers11129)
+}
 
 // softRateResetLoc 上游 429 6004 文案中的重置时间固定按 UTC+8 解释（上游文案如此，
 // 与容器时区无关）。
@@ -352,6 +381,24 @@ func IsModelBlocked(status int, body string) bool {
 	lowerMsg := strings.ToLower(msg)
 	return containsAnyMarker(lowerMsg, modelBlockMsgMarkers) ||
 		strings.Contains(lowerMsg, modelForbiddenMsgMarker)
+}
+
+// IsModelMissing 报告 body 是否是「这个模型 id 在上游不存在」的确定性答复（11102 / 14401，
+// 见 modelBlockMsgMarkers）。
+//
+// 与 IsModelBlocked 的 11158「该账号类型无权限」必须分开处置（issue #280）：11158 换个有权限
+// 的号仍可能成功（实测 global:gpt-6-luna → 11158 not allowed for user type [personal_free_user]），
+// 11102 换了整池都是同一句（实测 display name "DeepSeek-V4.1-Flash" 三个号 4.1s 全 11102，
+// 换成 id "deepseek-v4.1-flash" 立刻 200）——换号只是白打全池。
+func IsModelMissing(status int, body string) bool {
+	if !IsModelBlocked(status, body) {
+		return false
+	}
+	code, msg := modelBlockFields(body)
+	if code == modelForbiddenCode || strings.Contains(strings.ToLower(msg), modelForbiddenMsgMarker) {
+		return false
+	}
+	return true
 }
 
 // modelBlockFields 提取顶层或 error 子对象中的业务 code 与消息。
@@ -504,6 +551,12 @@ func ParseRetryAfter(h http.Header) (time.Duration, bool) {
 	return 0, false
 }
 
+// IsProviderOverloaded 报告 body 是否为 11134「模型供应商暂时不可用」。它与 6020/6021
+// 同归 ErrUpstreamBusy，但成因是供应商过载而不是排队：给客户端的文案要区分（队列满的
+// 措辞会让人去查排队），而且供应商过载时「换个模型」是有效出路，排队时不是。
+// 只认结构化 code，文案单独出现仍是普通 5xx。
+func IsProviderOverloaded(body string) bool { return hasBusinessCode(body, "11134") }
+
 // parseQueueRetryAfter 从排队/容量信封的 body 抽上游明示的重试等待时长。
 // 两种形态都认（整数秒，超 retryAfterSanity 按异常值封顶）：
 //
@@ -619,8 +672,9 @@ func ParseRateReset(body string) (time.Time, bool) {
 // Classify 按 HTTP 状态码 + body 判定错误类别。
 //
 // 判定顺序自「严」到「宽」，每层的先后都有语义依据：
-//  0. 11102（IsModelBlocked）——「该后端无此模型」确定性答复，语义最具体，最先判
-//     （只认 400/404，429+11102 属限流语义走第 4 层）。
+//  0. 11102/14401（IsModelMissing）——「该模型 id 上游不存在」确定性答复，语义最具体，
+//     最先判（只认 400/404，429+11102 属限流语义走第 4 层）；11158「该账号类型无权限」
+//     紧随其后（IsModelBlocked），两者处置不同：前者请求级不轮转，后者换号。
 //  1. 402 —— 真正的计费余额耗尽状态码，最严、最不可自愈，最先判。
 //  2. sessionDeadMarkers —— 需要人工重登的终态。若 401 body 同时含 "12153" 与
 //     "rate limit"（如网关错误页混排），归 session_dead：短冷却救不活失效 session，
@@ -656,10 +710,17 @@ func ParseRateReset(body string) (time.Time, bool) {
 //     错误/通用 4xx 之前，避免落 ErrClient 把健康号轮转一遍。
 //  12. 内容策略/参数错误/其他 4xx —— 通用兜底。
 func Classify(status int, body string) ErrKind {
-	// 11102「该后端无此模型」须最先判：它是「模型在后端不存在」的确定性答复，语义比
+	// 11102「该后端无此模型」须最先判：它是「模型在上游不存在」的确定性答复，语义比
 	// 计费/限流都更具体——若不先判，msg 里的 "service info not found" 会被更宽的
 	// 4xx 兜底归为 ErrClient（只换号不避让），该坏号会留在池内反复被选中。
+	// 归请求级（ErrModelMissing）而非 (账号,模型) 负缓存：模型 id 不存在时换遍全池是
+	// 同一句（issue #280 实测三号 4.1s 全 11102），轮转只是白打号。
 	// 只认 400/404（见 IsModelBlocked），429+11102 落下方 status==429 层走限流语义。
+	if IsModelMissing(status, body) {
+		return ErrModelMissing
+	}
+	// 11158「该账号类型无权使用该模型」保持 (账号,模型) 负缓存 + 换号：同模型在不同
+	// 账号类型上权限不同，换到有权限的号真能成功（见 IsModelMissing 注释的实测对照）。
 	if IsModelBlocked(status, body) {
 		return ErrModelBlocked
 	}
@@ -713,7 +774,7 @@ func Classify(status int, body string) ErrKind {
 	// vs 换号 0–12%）。
 	// 归 ErrUpstreamBusy = 不罚号 + body 侧解析 retry_policy.retry_after 后不轮转，
 	// 与 6020/6021 同一族（上游容量信号，自带重试口径）。
-	if hasBusinessCode(body, "11134") {
+	if IsProviderOverloaded(body) {
 		return ErrUpstreamBusy
 	}
 	// status==429 先于 hardMarkers：限流响应 body 高频携带 "quota exceeded"/
@@ -754,6 +815,19 @@ func Classify(status int, body string) ErrKind {
 		strings.Contains(body, "工具调用与工具结果不匹配") {
 		return ErrToolMismatch
 	}
+	// 音色未配置（TTS 专用）：上游用 **500 外壳** + code 10000 报
+	// "get voice config failed: voice X not found in Rainbow"，2026-11-20 真号实测。
+	// 音色表是全局配置、与账号无关，同一请求换任何号都是同一句；落 ErrServer 会让
+	// 网关轮转全池并给健康号各记一笔连败（与 11103 同一条代价链）。归请求级。
+	if status >= 500 && strings.Contains(lower, "get voice config failed") {
+		return ErrBadParams
+	}
+	// 15053「ASR recognition failed」：上游 502 + 业务码，指**这段音频**识别不出来
+	// （2026-11-20 实测：裸 PCM 不带容器头必现）。同一个文件换号也是同一句，归请求级；
+	// 落 ErrServer 会为一段坏音频轮转全池并给健康号各记一笔连败。
+	if codeMarker(lower, "15053") {
+		return ErrBadParams
+	}
 	if status == http.StatusNotFound {
 		return ErrNotFound
 	}
@@ -787,6 +861,15 @@ func Classify(status int, body string) ErrKind {
 				return ErrImageInvalid
 			}
 		}
+	}
+	// 11103「Backend [x] is not supported」：该模型的**上游后端未启用**（issue #280
+	// 实测：25 个号轮转 25 次全是同一句，上游自带 retry_policy.retry=false）。与
+	// 11102「该后端无此模型」不同——那不是账号权限问题，换遍全池结果一样，故不走
+	// ErrModelBlocked 的 (账号,模型) 负缓存避让，而归请求级零动作 + fail-fast 400：
+	// 落 ErrClient 的代价是每个健康号白记一笔连败，5 次达阈出池，末端 503
+	// no_healthy_account（把「换个模型」报成「账号都挂了」）。
+	if status == http.StatusBadRequest && hasBusinessCode(body, "11103") {
+		return ErrModelParamInvalid
 	}
 	// 11133「模型供应商拒绝了请求参数」（缺/空 messages、模型不支持图片、参数形态与
 	// 该模型版本不符等）与 11135 同族：确定性请求级错误，同一 body 换任何账号都会被
@@ -823,7 +906,7 @@ func Classify(status int, body string) ErrKind {
 		// 请求体阶段，还没走到模型路由，所以"不同账号可能有不同模型权限"其实是
 		// 11102（ErrModelBlocked）的理由，那里已有 (账号,模型) 负缓存避让
 		// （吸收上游 fd5c5a6）。
-		if strings.Contains(body, badParamsMarkerMsg) || strings.Contains(body, badParamsMarkerCode) {
+		if strings.Contains(body, badParamsMarkerMsg) || strings.Contains(body, badParamsMarkerCode) || isToolSchemaRejected(body, lower) {
 			return ErrBadParams
 		}
 		return ErrClient
@@ -904,6 +987,13 @@ type Client struct {
 	// 供出站请求体补默认 max_tokens：上游对缺失限额的请求套保守默认（实测
 	// 32000），Codex 等不发限额的客户端写大文件会被无声截断。与 efforts 共用锁。
 	modelMaxOut map[string]map[string]int64
+	// exclusive 该域里「免费号调不通」的模型（modelTiers 的 accessMode=exclusive）。
+	// 与 modelRates 同口径：目录刷新即整体替换，共用锁。
+	exclusive map[string]map[string]bool
+	// paidByUID 各账号「是不是付费号」（billing summary 的 IsPaidUser）。只在拿到
+	// 该字段时写入（目前只有 global 的 summary 给）；缺条目 = 不知道。
+	paidMu    sync.RWMutex
+	paidByUID map[string]bool
 
 	// globalModels 缓存 global 模型目录探测结果（1h TTL + 5min 负缓存；
 	// 探测与合并见 global_models.go）。目录权威 = 桌面端 UA 族，见该文件注释。
@@ -935,7 +1025,7 @@ type Client struct {
 	// 空 = 内置默认（对齐官方 5.5.4 分发包）。
 	ClientVersion string
 
-	// CliVersion 出站 UA 中 `CLI/<ver>` 段版本。空 = 内置默认（官方内置 CLI 2.137.1）。
+	// CliVersion 出站 UA 中 `CLI/<ver>` 段版本。空 = 内置默认（CN 包内置 CLI 2.176.0 / GL 2.165.0）。
 	CliVersion string
 
 	// ClientName 用量归属头取值（X-Product / X-IDE-Name / X-IDE-Type / X-IDE-Version）。
@@ -976,6 +1066,11 @@ type Client struct {
 	// modelBusyUnsupported 上游 /v2/chat/busy 在该域不存在（国际版实测 404）。探到一次即置位，
 	// 本进程后续跳过探测（见 modelbusy.go）。atomic：并发调用只读+一次性写。
 	modelBusyUnsupported atomic.Bool
+
+	// ThreeDCredential 混元 3D 的 `ck_t_` 临时云凭证来源（见 three_d_credential.go）。
+	// nil = 拿不到凭证 → 3D 一律回 503，不发请求。启动期挂载；凭证内容不进日志、
+	// 不进错误串、不落盘。
+	ThreeDCredential ThreeDCredential
 }
 
 // CreditObserver 余额查询观察者：每次**真实查到**余额后回调（uid + 余额绝对值）。
@@ -1791,7 +1886,10 @@ type ModelInfo struct {
 	// 「订阅优先」），空=不受限。只透文案不给布尔：海外是 Pro 专属（免费号调不通），
 	// 国内只是「优先调度」（能用，排队靠后），同一个 requiredUserType 两种语义，
 	// 一刀切成「不可用」会把国内这三个模型错标成禁选（issue #235）。
-	Tier              string
+	Tier string
+	// Exclusive accessMode=exclusive：免费号确实调不通（只有这一个字段能这么判，
+	// 文案不能）。选号据此跳过「已知免费」的号，见 pool 的 exclusiveModelOf。
+	Exclusive         bool
 	Vendor            string // vendor 厂商标识
 	IsDefault         bool   // isDefault 是否默认模型
 	SupportsReasoning bool   // supportsReasoning 是否支持推理
@@ -2267,7 +2365,11 @@ type v3ModelTier struct {
 	Enabled  bool     `json:"enabled"`
 	Priority int      `json:"priority"`
 	ModelIDs []string `json:"modelIds"`
-	Badge    *struct {
+	// AccessMode "exclusive" = 免费号根本调不通（海外 Pro Only 的机器可读口径）。
+	// CN 的「订阅优先」没有这个字段，只是排队靠后——把两者混成「不可用」会误拒
+	// 能用的请求（issue #235）。
+	AccessMode string `json:"accessMode"`
+	Badge      *struct {
 		Label string `json:"label"`
 	} `json:"badge"`
 }
@@ -2299,6 +2401,11 @@ func applyModelTiers(out map[string]ModelInfo, tiers []v3ModelTier) {
 			}
 			best[id] = t.Priority
 			mi.Tier = t.Badge.Label
+			// exclusive 与文案无关：CN 那条「订阅优先」同样带 label 但没有 accessMode，
+			// 落到这里的只有海外 Pro Only 这种真门控。
+			if strings.EqualFold(strings.TrimSpace(t.AccessMode), "exclusive") {
+				mi.Exclusive = true
+			}
 			out[id] = mi
 		}
 	}
@@ -2306,6 +2413,7 @@ func applyModelTiers(out map[string]ModelInfo, tiers []v3ModelTier) {
 	for _, id := range proOnlyFallback {
 		if mi, ok := out[id]; ok && mi.Tier == "" {
 			mi.Tier = "Pro Only"
+			mi.Exclusive = true // 实测免费号必 11158，与 accessMode=exclusive 同义
 			out[id] = mi
 		}
 	}
@@ -2417,9 +2525,13 @@ func effectiveModelRate(mi ModelInfo) string {
 // 倍率时写入空桶，使旧倍率不会继续冒充当前价。
 func (c *Client) storeModelRates(realm string, infos []ModelInfo) {
 	rates := make(map[string]string, len(infos))
+	excl := make(map[string]bool)
 	for _, mi := range infos {
 		if mi.ID == "" {
 			continue
+		}
+		if mi.Exclusive {
+			excl[mi.ID] = true
 		}
 		if rate := effectiveModelRate(mi); rate != "" {
 			rates[mi.ID] = rate
@@ -2430,7 +2542,47 @@ func (c *Client) storeModelRates(realm string, infos []ModelInfo) {
 	if c.modelRates == nil {
 		c.modelRates = make(map[string]map[string]string)
 	}
+	if c.exclusive == nil {
+		c.exclusive = make(map[string]map[string]bool)
+	}
 	c.modelRates[realmKey(realm)] = rates
+	c.exclusive[realmKey(realm)] = excl
+}
+
+// ModelExclusive 报告 (域, 模型) 是否「免费号调不通」（modelTiers accessMode=exclusive）。
+// 与 ModelRate 同口径：按 realm 分桶、目录刷新整体替换；未知一律 false（不拦）。
+func (c *Client) ModelExclusive(realm, model string) bool {
+	if c == nil || model == "" {
+		return false
+	}
+	c.effortsMu.RLock()
+	defer c.effortsMu.RUnlock()
+	return c.exclusive[realmKey(realm)][model]
+}
+
+// NotePaidUser 记录账号是不是付费号（billing summary 的 IsPaidUser）；只有拿到该字段
+// 时才调用，没调过 = 不知道（选号按「可用」处理，见 pool 的 exclusiveModelOf）。
+func (c *Client) NotePaidUser(uid string, paid bool) {
+	if c == nil || uid == "" {
+		return
+	}
+	c.paidMu.Lock()
+	defer c.paidMu.Unlock()
+	if c.paidByUID == nil {
+		c.paidByUID = make(map[string]bool)
+	}
+	c.paidByUID[uid] = paid
+}
+
+// PaidUser 返回记过的付费状态；第二个返回值为 false 表示没观测过（不是「免费」）。
+func (c *Client) PaidUser(uid string) (paid, known bool) {
+	if c == nil {
+		return false, false
+	}
+	c.paidMu.RLock()
+	defer c.paidMu.RUnlock()
+	paid, known = c.paidByUID[uid]
+	return paid, known
 }
 
 // storeModelMaxOut 按 realm 整体替换模型输出上限快照（maxOutputTokens）。
@@ -2450,6 +2602,16 @@ func (c *Client) storeModelMaxOut(realm string, infos []ModelInfo) {
 		c.modelMaxOut = make(map[string]map[string]int64)
 	}
 	c.modelMaxOut[realmKey(realm)] = m
+}
+
+// StoreModelMaxOutForTest 跨包测试钩子：直接写入某域的模型输出上限快照（真实路径由
+// FetchModels 刷新目录时写入）。仅测试引用。
+func (c *Client) StoreModelMaxOutForTest(realm string, maxOut map[string]int64) {
+	infos := make([]ModelInfo, 0, len(maxOut))
+	for id, n := range maxOut {
+		infos = append(infos, ModelInfo{ID: id, MaxTokens: n})
+	}
+	c.storeModelMaxOut(realm, infos)
 }
 
 // modelMaxOutSnapshot 返回输出上限快照副本；nil 表示未知（不补默认，行为同旧路径）。
@@ -2532,6 +2694,9 @@ func (c *Client) fetchV3ConfigModelMap(a *auth.Auth, ua string) (map[string]Mode
 		ua = c.v3ProbeUA(a)
 	}
 	req.Header.Set("User-Agent", ua)
+	// X-Client-*：真机 /v3/config 3/3 条都带（含 CLI 两段式 UA 那条），
+	// 证明注入挂在共享 HTTP 层而非某个 RPC 模块上。按 realm 隔离注入。
+	c.injectClientIdentityHeaders(req, a)
 	resp, err := c.do(req, a, false)
 	if err != nil {
 		return nil, nil, err
@@ -3190,12 +3355,7 @@ func IsAlreadyCheckin(err error) bool {
 	if !errors.As(err, &ue) {
 		return false
 	}
-	for _, m := range alreadyCheckinMarkers {
-		if strings.Contains(ue.Msg, m) || strings.Contains(strings.ToLower(ue.Msg), strings.ToLower(m)) {
-			return true
-		}
-	}
-	return false
+	return isAlreadyCheckinMsg(ue.Msg)
 }
 
 func truncate(s string, n int) string {
