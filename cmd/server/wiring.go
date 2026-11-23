@@ -24,6 +24,19 @@ func realmAwareAvailableForModel(p *pool.Pool) func(model string) []string {
 	}
 }
 
+// realmAwareNewSessionForModel 构造「新会话分配池」的 realm 感知闭包。
+//
+// 与 realmAwareAvailableForModel 的差别只在快过期聚焦（pool.expiring_focus）生效时：
+// 该闭包只返回聚焦目标号，让**新会话**集中到目标账号；而 AvailableForModel 保持全量，
+// 已绑定的老会话因此不会在切换瞬间被判失效并迁移——继续用原号直到 TTL 过期，
+// 之后再按当时的目标重新分配。
+func realmAwareNewSessionForModel(p *pool.Pool) func(model string) []string {
+	return func(model string) []string {
+		realm, bare := server.ResolveModel(model)
+		return p.NewSessionUIDsForModelRealm(bare, realm)
+	}
+}
+
 type alertSource struct {
 	pool *pool.Pool
 	h    *server.Handler

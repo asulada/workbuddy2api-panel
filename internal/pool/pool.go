@@ -103,6 +103,14 @@ type Pool struct {
 	// issue #62：同一层内配了占比的账号独占抽签，按 share 归一化分流量（70/30 与
 	// 7/3 同义，不必凑满 100）。缺省 nil = 全部未配置（行为与旧版一致）。
 	accountShare map[string]float64
+	// expiringFocus 快过期积分聚焦开关（SetExpiringFocus 注入，默认关）。
+	// 开启后把流量硬压到「窗口内快过期积分（creditsExpiring）最多」的账号，
+	// 把额度烧在过期前；关闭则完全回到既有加权路由。见 focus.go。
+	expiringFocus bool
+	// expiringFocusUID 聚焦目标锁定表（realm → uid）。**锁定而非每次现算**：
+	// 扣费会让 creditsExpiring 逐笔下降，现算最大值会让目标在两个号接近时反复
+	// 翻转，两边都烧不完（详见 focus.go 的说明）。运行态，不落 state.json。
+	expiringFocusUID map[string]string
 	// randInt64N 仅供测试注入确定性随机源；nil 时用 math/rand/v2 全局源。
 	// 生产代码不应设置此字段。
 	randInt64N func(n int64) int64
@@ -147,6 +155,7 @@ func New(stateFp string) *Pool {
 		// config 显式 "0" 关停（SetCostExploreInterval(0)）。
 		costExploreInterval: defaultCostExploreInterval,
 		exploreLast:         map[string]time.Time{},
+		expiringFocusUID:    map[string]string{},
 		strategy:            StrategyWeighted,
 		scheduling:          map[string]scheduleCursor{},
 	}

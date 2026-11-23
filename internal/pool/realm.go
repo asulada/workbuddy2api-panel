@@ -101,8 +101,87 @@ func (p *Pool) WeightedAvailableUIDsForModelRealm(model, realm string) []string 
 	return out
 }
 
+// NewSessionUIDsForModelRealm 返回**新会话可分配**的账号列表（session 慢路径用）。
+//
+// 与 WeightedAvailableUIDsForModelRealm 的唯一差别：快过期聚焦（pool.expiring_focus）
+// 生效时只返回目标号。这样新会话必然落到目标号上，而**已绑定的老会话不受影响**——
+// 它们的可用性校验走 AvailableUIDsForModelRealm（不收窄），继续用原号直到 TTL 过期，
+// 之后按当时的聚焦目标重新分配。渐进迁移，避免切换瞬间全部会话前缀缓存 miss。
+//
+// 未开聚焦 / 无目标 / 显式配置（account_share、非 weighted 策略）让位时，与
+// WeightedAvailableUIDsForModelRealm 完全一致（聚焦的让位判定复用同一函数）。
+func (p *Pool) NewSessionUIDsForModelRealm(model, realm string) []string {
+	out := p.WeightedAvailableUIDsForModelRealm(model, realm)
+	if len(out) <= 1 {
+		return out
+	}
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	if !p.expiringFocus {
+		return out
+	}
+	uid := p.sessionFocusTargetLocked(model, realm)
+	if uid == "" {
+		return out
+	}
+	// 目标号在 out 里至少出现一次（重量列表按 slots 重复）：保留全部副本，
+	// 保持「虚拟实例权重」语义不变；目标号不可用时保持原列表，避免把新会话饿死。
+	kept := make([]string, 0, len(out))
+	for _, u := range out {
+		if u == uid {
+			kept = append(kept, u)
+		}
+	}
+	if len(kept) == 0 {
+		return out
+	}
+	return kept
+}
+
+// sessionFocusTargetLocked 返回快过期聚焦对**新会话**的分配目标；无目标返回空串。
+//
+// 与 pick 的 focusExpiringLocked 共用同一份锁定表（p.expiringFocusUID），但**不做
+// 交棒判定**：session 慢路径只在「没有可用绑定」时调用，此时若顺手改写锁定表，
+// 一个刚启动、余额还没刷新的进程会把锁定表写满错误目标。真正的交棒由 pick 负责
+// （它每笔请求都会跑，且能看到成本层/在途等完整上下文）。
+// 这里只回答「当前锁的是谁，它在这个模型上可用吗」，不可用就返回空串让新会话照常散列。
+// 调用方须持 p.mu。
+func (p *Pool) sessionFocusTargetLocked(model, realm string) string {
+	uid := p.expiringFocusUID[realm]
+	if uid == "" {
+		return ""
+	}
+	// 显式配置让位：与 focusExpiringLocked 同判据（占比按比例分，与独占互斥；
+	// 轮询/顺序耗尽的环也是显式配置）。这里只读锁定表，故用全集判断占比。
+	if p.strategy != "" && p.strategy != StrategyWeighted {
+		return ""
+	}
+	for _, e := range p.byUID {
+		if p.shareOf(e.a.UID) > 0 {
+			return ""
+		}
+	}
+	e, ok := p.byUID[uid]
+	if !ok {
+		return ""
+	}
+	now := time.Now()
+	if e.creditsExpiring <= 0 {
+		return ""
+	}
+	if p.focusAccountUnusableLocked(e, now, model) {
+		return ""
+	}
+	return uid
+}
+
 // AvailableUIDsForModelRealm 同 AvailableUIDsForModel，但仅返回 Realm()==realm 的账号
 // （6004 模型豁免照常生效）。realm=="" 退化为 AvailableUIDsForModel。
+//
+// **不套快过期聚焦**：这个列表同时用于「已绑定会话的可用性校验」（session 快路径
+// availableSet）。一旦在这里收窄成单号，所有老会话会立刻判定「绑定号不可用」而被
+// 迁移到目标号——那正是「新会话才迁移、老会话等 TTL 自然过期」要避免的瞬间全量
+// 缓存失效。聚焦只作用于新会话的分配池，见 NewSessionUIDsForModelRealm。
 func (p *Pool) AvailableUIDsForModelRealm(model, realm string) []string {
 	p.mu.RLock()
 	defer p.mu.RUnlock()

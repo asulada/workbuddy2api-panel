@@ -43,6 +43,16 @@ type Config struct {
 	// 模型级限额后对**其他模型**仍可用（issue #31 豁免），此时若只按账号级可用性
 	// 校验，会话会被钉在这个号上反复失败——正是"限额后换不动号"的观感来源。
 	AvailableForModel func(model string) []string
+	// NewSessionForModel 返回「新会话可分配」的账号列表。nil 时回落 AvailableForModel
+	// （行为与引入该字段前完全一致）。
+	//
+	// 与 AvailableForModel 分开的理由：前者同时承担「已绑定会话是否仍可用」的校验，
+	// 后者只用于**未绑定会话的首次分配**。快过期聚焦（pool.expiring_focus）需要
+	// 「新会话都去目标号，老会话保留原号到 TTL 过期」，只有把两个用途拆开才能同时满足；
+	// 合成一个列表则会二选一地错（老会话瞬间全量迁移 / 聚焦对会话路径完全无效）。
+	//
+	// 返回列表可含重复 uid（虚拟实例权重），哈希分配照旧。
+	NewSessionForModel func(model string) []string
 }
 
 // Router 会话粘性路由器。
@@ -175,7 +185,7 @@ func (r *Router) ResolveForModel(key, model string) (string, bool) {
 		delete(r.entries, key) // 失效：清掉再分配
 	}
 
-	uids := r.availableSlice(model)
+	uids := r.newSessionSlice(model)
 	if len(uids) == 0 {
 		return "", false
 	}
@@ -289,6 +299,8 @@ func (r *Router) availableSet(model string) map[string]bool {
 }
 
 // availableSlice 安全调用 AvailableForModel；未注入时回落 Available（nil 视空池）。
+// **用途**：已绑定会话的可用性校验（快路径 availableSet）——必须是全量，不能收窄，
+// 否则老会话会因「绑定号不在列表里」被判定失效并立刻迁移。
 func (r *Router) availableSlice(model string) []string {
 	if r.cfg.AvailableForModel != nil {
 		return r.cfg.AvailableForModel(model)
@@ -297,6 +309,19 @@ func (r *Router) availableSlice(model string) []string {
 		return nil
 	}
 	return r.cfg.Available()
+}
+
+// newSessionSlice 新会话**分配池**：优先 NewSessionForModel（快过期聚焦生效时只含
+// 目标号），未注入时回落 availableSlice（行为与引入聚焦前完全一致）。
+//
+// 为什么分配池与校验集必须分开：聚焦的语义是「新会话都去目标号」，但老会话要
+// 「保留原号直到 TTL 过期」。若两者共用一份列表，二选一都会错——共用收窄版则老会话
+// 立刻全量迁移（前缀缓存全 miss），共用全量版则聚焦对会话路径完全无效（改了个寂寞）。
+func (r *Router) newSessionSlice(model string) []string {
+	if r.cfg.NewSessionForModel != nil {
+		return r.cfg.NewSessionForModel(model)
+	}
+	return r.availableSlice(model)
 }
 
 func expired(e entry, now time.Time, ttl time.Duration) bool {

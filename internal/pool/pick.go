@@ -154,6 +154,40 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
 			ws = append(ws, weighted{e: e, tier: ti, cost1k: ci})
 		}
 	}
+	// 快过期积分聚焦（pool.expiring_focus，见 focus.go）：把本次候选硬压到「窗口内
+	// 快过期积分最多」的那一个号上，让它先被烧掉。
+	//
+	// 次序：**成本分层之后、top5 截断之前**。
+	//   - 排在成本分层之后：聚焦是「先烧哪个号」的问题，不是「免费还是收费」的问题。
+	//     若排在之前，目标号是 tier 2（已实测收费）而另有 tier 0 免费号时，聚焦会把
+	//     请求从免费号拽到收费号上——为了不浪费积分反而花了钱。
+	//   - 排在 top5 截断之前：目标号可能权重排在第 6 名开外（余额少但快过期积分多，
+	//     正是本功能最想烧的那种号），截断后再聚焦等于永远够不着。
+	// 收窄时保持 ws 原序（聚焦结果是单元素，序无意义；未收窄时一个都不动）。
+	// 条件写 `> 0` 而不是 `> 1`：即使只剩一个候选，也要跑一次本逻辑来**维护锁定状态**。
+	// 只剩单候选时收窄没有意义（结果还是它），但跳过会让「锁定号已停牌/已移除」这类
+	// 账号级不可用永远得不到判定——候选长期只有一个号时，focus_locked 会一直挂在那个
+	// 已经不该锁的号上，运维看到的观测值是假的。
+	if p.expiringFocus && len(ws) > 0 {
+		entries := make([]*entry, len(ws))
+		for i := range ws {
+			entries[i] = ws[i].e
+		}
+		// all 传成本分层前的全集（此刻 cands 尚未被 ws 覆盖），见 focus.go 的说明。
+		if kept := p.focusExpiringLocked(entries, cands, realm, reqModel, now); len(kept) < len(entries) {
+			keep := make(map[string]bool, len(kept))
+			for _, e := range kept {
+				keep[e.a.UID] = true
+			}
+			out := ws[:0]
+			for _, w := range ws {
+				if keep[w.e.a.UID] {
+					out = append(out, w)
+				}
+			}
+			ws = out
+		}
+	}
 	// 窗口用量调度（issue #112）：按 (账号, 模型) 在本窗口内已花的 token 反比降权，
 	// 权重 /= 1 + used/mean。分母取**同层均值**而不是固定阈值：量纲自洽，换池子规模、
 	// 换模型倍率都不用调参；全员 0 用量时除数恒 1，行为与旧版逐字节一致。

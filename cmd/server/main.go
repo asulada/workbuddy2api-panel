@@ -160,6 +160,8 @@ func main() {
 	p.SetPreferExpiring(cfg.Pool.PreferExpiring, cfg.ExpiringSoonDur)
 	p.SetAccountPriority(cfg.Pool.AccountPriority) // 账号优先级/占比（issue #62）：空表 = 不启用
 	p.SetAccountShare(cfg.Pool.AccountShare)
+	// 快过期积分聚焦（pool.expiring_focus）：按窗口内金额把流量硬压到单号；默认关。
+	p.SetExpiringFocus(cfg.Pool.ExpiringFocus)
 	// 选号策略（pool.selection_strategy）：weighted 缺省 / round_robin / sequential。
 	p.SetStrategy(cfg.Pool.SelectionStrategy)
 
@@ -178,6 +180,8 @@ func main() {
 			// realm 感知闭包：带前缀模型名按 realm 过滤可用账号（跨 realm 不泄漏）；
 			// 裸名走 cn（现状零回归）。闭包内部 resolveModel 剥前缀，再按 realm 过滤。
 			AvailableForModel: realmAwareAvailableForModel(p),
+			// 新会话分配池：快过期聚焦生效时只含目标号（老会话不受影响，见该字段注释）。
+			NewSessionForModel: realmAwareNewSessionForModel(p),
 		})
 		sessRouter.LoadFromStore() // 启动时从 Redis 恢复粘性（读操作仅此处）
 		sessRouter.StartGC()
@@ -792,7 +796,7 @@ func panelListenPath(listen string) string {
 //
 // 热生效范围（设计取舍）：
 //   - api_key / cooldown.soft_rate / features.sanitize_blacklist_fingerprints → livecfg 快照
-//   - pool.* → pool.SetBreaker/SetMaxInFlight/SetSoftRateMax/SetWeights/SetCostExploreInterval/SetPreferExpiring（含快过期窗口）/SetAccountPriority/SetAccountShare/SetCreditFloor
+//   - pool.* → pool.SetBreaker/SetMaxInFlight/SetSoftRateMax/SetWeights/SetCostExploreInterval/SetPreferExpiring（含快过期窗口）/SetAccountPriority/SetAccountShare/SetExpiringFocus/SetCreditFloor
 //   - schedule.* → scheduler.Reconfigure/SetBalanceInterval/SetExpiringSoonWindow
 //
 // 需重启（涉及监听地址、HTTP client 超时、auth_dir 等装配期依赖）：
@@ -970,7 +974,8 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 	p.SetReserveCreditsByRealm(newCfg.Pool.ReserveCreditsByRealm) // 按域覆盖热生效（issue #147）
 	p.SetAccountPriority(newCfg.Pool.AccountPriority)             // 账号优先级/占比热生效（issue #62）
 	p.SetAccountShare(newCfg.Pool.AccountShare)
-	p.SetStrategy(newCfg.Pool.SelectionStrategy) // 选号策略热生效
+	p.SetExpiringFocus(newCfg.Pool.ExpiringFocus) // 快过期积分聚焦热生效（默认关）
+	p.SetStrategy(newCfg.Pool.SelectionStrategy)  // 选号策略热生效
 	sch.Reconfigure(scheduler.ScheduleParams{
 		CheckinHours:   newCfg.Schedule.CheckinHours,
 		TravelHours:    newCfg.Schedule.TravelHours,

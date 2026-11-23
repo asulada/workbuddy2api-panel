@@ -135,6 +135,7 @@
     "idle_weight_max": 5.0,
     "prefer_expiring": true,
     "expiring_soon": "168h",
+    "expiring_focus": false,
     "account_priority": {},
     "account_share": {},
     "cost_explore_interval": "30m",

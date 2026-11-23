@@ -472,6 +472,18 @@ type Config struct {
 		// 非正值（priority ≤ 0 / share ≤ 0）由校验剔除，等价于未配置。
 		AccountPriority map[string]int     `json:"account_priority"`
 		AccountShare    map[string]float64 `json:"account_share"`
+		// ExpiringFocus 快过期积分聚焦（默认 false = 关闭，零行为变化）。
+		// 开启后把流量**硬压**到「expiring_soon 窗口内快过期积分（credits_expiring）最多」的
+		// 那个账号上，让这批额度在过期前被烧掉；该号不可用或窗口内额度烧光后自动交棒给下一个。
+		//
+		// 与 prefer_expiring 的分工（两者可同时开，不冲突）：
+		//   prefer_expiring  软加权：倍率只按「剩余时间」算，多号同时命中窗口时按概率分摊；
+		//   expiring_focus   硬分层：按「金额」选唯一目标并独占，直到把它的窗口内额度烧光。
+		// 优先级：显式配置一律压过它——account_priority（先烧层）、account_share（占比）、
+		// selection_strategy（非 weighted）任一存在时本功能整体让位。
+		// 代价（有意为之）：集中期间其余账号分不到轮换流量、长期积分不动；这正是
+		// 「先把快过期的烧完」的语义，不是缺陷。
+		ExpiringFocus bool `json:"expiring_focus"`
 		// CreditFloor 积分保底：账号余额低于该值时，对实测收费模型（tier 2）不再
 		// 参与选号——防止收费请求把余额打穿、连免费模型都 402 冷却到次日签到。
 		// tier 0（免费）不受限；tier 1（无观测）按目录倍率分档：≤ 下面的
@@ -651,6 +663,9 @@ func Default() *Config {
 	// credits_expiring 全 0，选号退化成普通加权）。窗口内是相对紧迫度，放宽不会
 	// 让紧迫度失真，只是把「今天到期 vs 四周后到期」也纳入同一条曲线。
 	c.Pool.ExpiringSoon = "720h"
+	// ExpiringFocus 缺省关（零值即 false，这里显式写出来是为了在 Default 里可检索）：
+	// 硬集中单号会改变既有流量分布，必须由使用者主动开。
+	c.Pool.ExpiringFocus = false
 	// costTier 探索默认 30m（issue #136：垄断破除 + 搭车改道零新增请求）；"0" 关停。
 	c.Pool.CostExploreInterval = "30m"
 	// 窗口用量调度默认 1h（issue #112：热点号降权，把流量摊给闲置号）；"0" 关停。
@@ -910,6 +925,11 @@ func applyEnv(c *Config) {
 			c.Pool.PreferExpiring = b
 		}
 	}
+	if v := os.Getenv("WB2A_EXPIRING_FOCUS"); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			c.Pool.ExpiringFocus = b
+		}
+	}
 }
 
 // EnvironmentManagedFields 列出被启动环境变量覆盖的配置字段路径（**值不回传**——
@@ -937,6 +957,7 @@ func (c *Config) EnvironmentManagedFields() []string {
 		{"WB2A_THINKING_CLIENT_PRIORITY", "thinking.client_priority", "bool"},
 		{"WB2A_THINKING_OVERRIDE_SCOPE", "thinking.override_scope", ""},
 		{"WB2A_EXPIRING_SOON", "pool.expiring_soon", ""}, {"WB2A_PREFER_EXPIRING", "pool.prefer_expiring", "bool"},
+		{"WB2A_EXPIRING_FOCUS", "pool.expiring_focus", "bool"},
 		{"WB2A_SCHEDULE_JITTER_MINUTES", "schedule.jitter_minutes", "int"},
 		{"WB2A_SCHEDULE_ACCOUNT_SPREAD_MINUTES", "schedule.account_spread_minutes", "int"},
 		{"WB2A_SCHEDULE_ACCOUNT_SPREAD_MIN_GAP_SECONDS", "schedule.account_spread_min_gap_seconds", "int"},

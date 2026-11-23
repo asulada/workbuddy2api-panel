@@ -1630,6 +1630,9 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
             </div>
             <div class="switch"><span class="lb">快过期积分优先</span>
               <input type="checkbox" name="prefer_expiring"></div>
+            <div class="switch"><span class="lb">快过期积分聚焦（独占单号）</span>
+              <input type="checkbox" name="expiring_focus">
+              <span class="hint">开启后把流量硬压到「上面窗口内快过期积分最多」的一个账号，烧光或不可用才换下一个。显式 account_priority / account_share / 非 weighted 选号策略存在时自动让位</span></div>
           </div>
         </div>
 

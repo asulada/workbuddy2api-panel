@@ -866,6 +866,7 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 		CreditsExpiryBuckets: append([]ExpiryBucket(nil), e.expiryBuckets...),
 		Priority:             p.priorityOf(uid),
 		Share:                p.shareOf(uid),
+		FocusLocked:          p.isFocusLocked(uid),
 		Cooling:              now.Before(e.until) || now.Before(e.breakerUntil),
 		SessionDeadFails:     e.sessionDeadFails,
 		Disabled:             e.disabled,
