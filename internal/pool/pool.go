@@ -121,6 +121,10 @@ type Pool struct {
 	// 扣费会让 creditsExpiring 逐笔下降，现算最大值会让目标在两个号接近时反复
 	// 翻转，两边都烧不完（详见 focus.go 的说明）。运行态，不落 state.json。
 	expiringFocusUID map[string]string
+	// expiringFocusDry 聚焦「本域一个候选都没有」的告警去抖（realm → 已告警）。
+	// 只把「功能静默停摆」变成一条可观测事件：某个 realm 从有候选变成零候选时打一条，
+	// 恢复时静默清掉。运行态，不落 state.json。
+	expiringFocusDry map[string]bool
 	// randInt64N 仅供测试注入确定性随机源；nil 时用 math/rand/v2 全局源。
 	// 生产代码不应设置此字段。
 	randInt64N func(n int64) int64
@@ -166,6 +170,7 @@ func New(stateFp string) *Pool {
 		costExploreInterval: defaultCostExploreInterval,
 		exploreLast:         map[string]time.Time{},
 		expiringFocusUID:    map[string]string{},
+		expiringFocusDry:    map[string]bool{},
 		strategy:            StrategyWeighted,
 		scheduling:          map[string]scheduleCursor{},
 	}

@@ -183,6 +183,57 @@ func sanitizeExpiryBuckets(in []ExpiryBucket, now time.Time) []ExpiryBucket {
 	return out
 }
 
+// refreshExpiringFromBucketsLocked 用「当前时刻 + 当前窗口」从批次明细重算一只账号的
+// creditsExpiring，按 SetCreditsSnapshot 的同一口径（钳到 [0, credits]）回写并返回。
+//
+// 为什么需要它：creditsExpiring 是**刷新那一刻**拿当时窗口筛出来的快照，而窗口是相对
+// 当前时刻的——一批 730h 后到期的积分会在 10 小时后滑进 720h 窗口，但没有任何代码会
+// 因此重算，它在路由眼里就一直不存在，直到下一次余额刷新。窗口越短、刷新越稀，这段
+// 盲区越长（窗口 48h + 每 12h 刷新一次 = 最坏 12h 内整池都看不见）。
+//
+// 调用点只有一条：focus.go 的「聚焦一个候选都选不出来」慢路径。正常情况走不到这里，
+// 所以热路径零成本。
+//
+// 必须回写而非只算局部值：交棒判定（focusCandidateLocked 上游的
+// `e.creditsExpiring <= 0`）、会话分配（realm.go 的 sessionFocusTargetLocked）和面板
+// 读的都是 entry 上的字段；只算一次局部值，锁定会在下一次请求就被判成「已烧光」而抖掉。
+//
+// 两条保守：窗口 <= 0（未注入/禁用）或 buckets 为空（旧 state、只写过聚合字段的调用方）
+// 时原值返回不动——没有明细就无从重算，把字段清零反而会凭空关掉聚焦。调用方须持 p.mu。
+func (p *Pool) refreshExpiringFromBucketsLocked(e *entry, now time.Time) int64 {
+	if e == nil {
+		return 0
+	}
+	win := p.expiringWindow
+	if win <= 0 || len(e.expiryBuckets) == 0 {
+		return e.creditsExpiring
+	}
+	deadline := now.Add(win)
+	var sum int64
+	for _, b := range e.expiryBuckets {
+		if b.Remain <= 0 || b.ExpireAt.IsZero() || !b.ExpireAt.After(now) {
+			continue // 已过期的桶：明细里可能还没被扣费清掉
+		}
+		if b.ExpireAt.After(deadline) {
+			break // sanitizeExpiryBuckets 保证按到期时间升序，后面的更晚
+		}
+		sum += b.Remain
+	}
+	if sum > e.credits {
+		// 与 SetCreditsSnapshot 同口径：批次合计可能是脏的（上游总余额已扣、明细没跟着扣），
+		// 直接信它会让选号决策被一个不可能的数字带走。
+		sum = e.credits
+	}
+	if sum < 0 {
+		sum = 0
+	}
+	if sum != e.creditsExpiring {
+		e.creditsExpiring = sum
+		p.dirty.Store(true)
+	}
+	return sum
+}
+
 // ClearExpiringSnapshots 清空所有账号的快过期/最早到期缓存。配置窗口改变时调用，
 // 避免在新快照写入前继续使用旧窗口得到的路由数据；下一次签到或余额刷新会重建。
 func (p *Pool) ClearExpiringSnapshots() {

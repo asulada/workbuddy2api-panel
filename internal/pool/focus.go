@@ -13,7 +13,10 @@
 // 绕过健康/冷却/在途/积分保底/停牌——那些都在候选收集阶段就逐出了。
 package pool
 
-import "time"
+import (
+	"log"
+	"time"
+)
 
 // SetExpiringFocus 注入快过期积分聚焦开关（pool.expiring_focus，默认关）。
 // 关闭 → 立即清空锁定，回到纯加权路由；开启 → 下一次 pick 选目标。
@@ -27,6 +30,7 @@ func (p *Pool) SetExpiringFocus(enabled bool) {
 	}
 	p.expiringFocus = enabled
 	p.expiringFocusUID = map[string]string{}
+	p.expiringFocusDry = map[string]bool{}
 }
 
 // focusExpiringLocked 把候选收窄到聚焦目标（返回单元素切片），无法聚焦时原样返回。
@@ -96,10 +100,14 @@ func (p *Pool) focusExpiringLocked(layer, all []*entry, realm, reqModel string, 
 			return layer
 		}
 	}
-	best := p.focusCandidateLocked(layer)
+	best := p.focusCandidateLocked(layer, now)
 	if best == nil {
-		return layer // 没有任何号持有窗口内的快过期积分 → 不聚焦，行为与未开一致
+		// 没有任何号持有窗口内的快过期积分 → 不聚焦，行为与未开一致。
+		// 这一支是「功能在跑但整池停摆」，与「一直没积分」外观相同，故留一条日志。
+		p.noteFocusDryLocked(realm, len(layer))
+		return layer
 	}
+	delete(p.expiringFocusDry, realm) // 恢复：下次再停摆时重新告警一次
 	// 惰性初始化：New() 已建好这张表，但包内直接构造 Pool（测试/嵌入方）时可能是 nil，
 	// 而 nil map 赋值会 panic。这里补一次，代价可忽略。
 	if p.expiringFocusUID == nil {
@@ -143,8 +151,35 @@ func (p *Pool) focusAccountUnusableLocked(e *entry, now time.Time, model string)
 // focusCandidateLocked 选出聚焦目标：窗口内快过期积分最多者。
 // 并列时的次序：最早到期 → UID 字典序（纯确定性，不引入随机——目标是「这段时间
 // 就烧这一个号」，随机挑目标只会让相邻两次重启/交棒换号）。
+//
+// 快路径只读 creditsExpiring，热路径零成本。**全零时走一次慢路径**：用批次明细按
+// 当前窗口重算并回写（refreshExpiringFromBucketsLocked）。
+//
+// 慢路径要解决的不是精度，是「空转」：creditsExpiring 是刷新那一刻算的快照，批次
+// 滑进窗口不会触发重算，于是整池字段全是 0 时本函数返回 nil，聚焦静默退回普通加权、
+// 一点痕迹都没有。只在全零时才补算——只要有一个号有值，需求落在它身上就已达成「烧
+// 快过期的积分」这个目的，别号的数字准不准不影响总浪费（金额/到期先后的排序在
+// 浪费总量上是等价的，见 focusBetter）。
+//
 // 调用方须持 p.mu。
-func (p *Pool) focusCandidateLocked(cands []*entry) *entry {
+func (p *Pool) focusCandidateLocked(cands []*entry, now time.Time) *entry {
+	if best := focusBest(cands); best != nil {
+		return best
+	}
+	recomputed := false
+	for _, e := range cands {
+		if p.refreshExpiringFromBucketsLocked(e, now) > 0 {
+			recomputed = true
+		}
+	}
+	if !recomputed {
+		return nil // 连明细里都没有：确实没有快过期积分，不是快照滞后
+	}
+	return focusBest(cands)
+}
+
+// focusBest 纯读择优，供快慢两条路径共用。
+func focusBest(cands []*entry) *entry {
 	var best *entry
 	for _, e := range cands {
 		if e.creditsExpiring <= 0 {
@@ -155,6 +190,30 @@ func (p *Pool) focusCandidateLocked(cands []*entry) *entry {
 		}
 	}
 	return best
+}
+
+// noteFocusDryLocked 聚焦「本域一个候选都没有」的一次性告警。
+//
+// 去抖到「状态变化」：某 realm 从有候选变成零候选时打一条，恢复后静默清标记，
+// 下次再停摆时重新打。为什么不每次都打：整批积分烧完、或本来就没积分要过期时
+// 全池为 0 是正常形态，逐请求打会把日志刷满。
+// 为什么要有这条：停摆的唯一后果是「一批积分到期前没被烧掉」，要等账单出来才看得见；
+// 而日志里那行一出现，就知道是「窗口太长/刷新太稀」这类可调的东西，不是功能坏了。
+// 调用方须持 p.mu。
+func (p *Pool) noteFocusDryLocked(realm string, candidates int) {
+	if p.expiringFocusDry[realm] {
+		return
+	}
+	if p.expiringFocusDry == nil { // 包内直接构造 Pool 时可能是 nil
+		p.expiringFocusDry = map[string]bool{}
+	}
+	p.expiringFocusDry[realm] = true
+	r := realm
+	if r == "" { // 与 Auth.Realm 的归一化口径一致，避免日志里出现 realm=
+		r = "cn"
+	}
+	log.Printf("INFO: [pool] 快过期积分聚焦：realm=%s 快过期窗口 %s 内没有任何账号持有快过期积分（候选 %d 个）→ 本次起退回普通加权，直到有积分进窗口；若积分确实在近期到期，考虑调大 expiring_soon",
+		r, p.expiringWindow, candidates)
 }
 
 // focusBetter 报告 a 是否比 b 更适合当聚焦目标。判据见 focusCandidateLocked。

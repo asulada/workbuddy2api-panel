@@ -6,6 +6,9 @@
 package pool
 
 import (
+	"bytes"
+	"log"
+	"strings"
 	"testing"
 	"time"
 
@@ -426,4 +429,79 @@ func n(uids []string) map[string]bool {
 		m[u] = true
 	}
 	return m
+}
+
+// focusBucket 写一份「只有按日批次、窗口内金额为 0」的余额快照，模拟真实形态：
+// 刷新那一刻这批还在窗口外（expiring = 0），之后才滑进窗口；而 creditsExpiring 是
+// 快照，不会随时间推进自动重算。
+func focusBucket(p *Pool, uid string, credits int64, at time.Time, remain int64) {
+	p.SetCreditsSnapshot(uid, CreditsSnapshot{
+		Remain:        credits,
+		Total:         credits,
+		ExpiryBuckets: []ExpiryBucket{{Date: at.Format("2006-01-02"), ExpireAt: at, Remain: remain}},
+	})
+}
+
+// TestExpiringFocusSlowPathSeesBucketCrossedIntoWindow：全池 creditsExpiring 都是 0、
+// 但批次明细里确实有一批已进窗口时，慢路径要用明细现算并**回写**——否则第一个请求
+// 选中它、第二个请求就因「字段还是 0」判成烧光而交棒，流量在两个号之间来回抖。
+func TestExpiringFocusSlowPathSeesBucketCrossedIntoWindow(t *testing.T) {
+	withNoPickGap(t)
+	p := mkPool(2, 1000, 1000)
+	p.SetPreferExpiring(true, 48*time.Hour) // 慢路径要窗口：未注入（<=0）时无从重算
+	focusBucket(p, "u1", 1000, time.Now().Add(12*time.Hour), 500)
+	p.SetExpiringFocus(true)
+
+	if got := pickAll(p, 20); got["u1"] != 20 {
+		t.Fatalf("批次已进窗口时聚焦应独占 u1，实际 %v", got)
+	}
+	if st, _ := p.Status("u1"); st.CreditsExpiring != 500 {
+		t.Fatalf("慢路径应把重算值回写到字段（交棒判定/会话分配/面板都读它），实际 %d", st.CreditsExpiring)
+	}
+	if st, _ := p.Status("u0"); st.FocusLocked {
+		t.Fatalf("u0 不该被标成聚焦目标：%+v", st)
+	}
+}
+
+// TestExpiringFocusSlowPathClampsBucketSumToCredits：上游「总余额已扣、批次明细没跟着
+// 扣」时批次合计会大于余额，重算必须按 SetCreditsSnapshot 同一口径钳到 credits，
+// 否则脏数据直接决定「谁金额最多」。
+func TestExpiringFocusSlowPathClampsBucketSumToCredits(t *testing.T) {
+	withNoPickGap(t)
+	p := mkPool(3, 1000, 1000, 1000)
+	p.SetPreferExpiring(true, 48*time.Hour)
+	at := time.Now().Add(12 * time.Hour)
+	focusBucket(p, "u1", 400, at, 900)                 // 脏：批次 900 > 余额 400
+	focusBucket(p, "u2", 1000, at.Add(time.Hour), 500) // 干净：500
+	p.SetExpiringFocus(true)
+
+	if got := pickAll(p, 20); got["u2"] != 20 {
+		t.Fatalf("钳到总余额后 u2(500) 应胜过 u1(400)，实际 %v", got)
+	}
+	if st, _ := p.Status("u1"); st.CreditsExpiring != 400 {
+		t.Fatalf("批次合计应钳到余额 400，实际 %d", st.CreditsExpiring)
+	}
+}
+
+// TestExpiringFocusNoCandidateFallsBackAndLogsOnce：整池确实没有快过期积分时，聚焦
+// 退回普通加权（不能把流量锁死在一个号上），并且只告警一条——去抖到「状态变化」，
+// 否则逐请求打会把日志刷满。
+func TestExpiringFocusNoCandidateFallsBackAndLogsOnce(t *testing.T) {
+	withNoPickGap(t)
+	p := mkPool(2, 1000, 1000)
+	p.SetPreferExpiring(true, 48*time.Hour)
+	p.SetExpiringFocus(true)
+
+	prev := log.Writer()
+	var buf bytes.Buffer
+	log.SetOutput(&buf)
+	defer log.SetOutput(prev)
+
+	got := pickAll(p, 30)
+	if len(got) != 2 {
+		t.Fatalf("零候选时应退回普通加权（两号都分到流量），实际 %v", got)
+	}
+	if c := strings.Count(buf.String(), "快过期积分聚焦"); c != 1 {
+		t.Fatalf("停摆只应告警一次，实际 %d 次：%s", c, buf.String())
+	}
 }

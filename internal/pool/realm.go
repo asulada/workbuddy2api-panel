@@ -167,6 +167,10 @@ func (p *Pool) sessionFocusTargetLocked(model, realm string) string {
 	}
 	now := time.Now()
 	if e.creditsExpiring <= 0 {
+		// 可能是真的烧光了，也可能只是快照滞后（批次刚滑进窗口）。这里在 RLock 下不能
+		// 回写，故直接返回空串让新会话照常散列；下一次请求的 pick 会在「全零」慢路径里
+		// 用批次明细把字段修正过来（见 refreshExpiringFromBucketsLocked），之后本函数
+		// 自然就能看到它。代价最多是一次新会话的落点不收敛。
 		return ""
 	}
 	if p.focusAccountUnusableLocked(e, now, model) {
