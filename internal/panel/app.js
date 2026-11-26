@@ -3597,7 +3597,8 @@ function renderUsage(d) {
 
   renderUsageDim();
   renderCreditDim();
-  renderUsageChart(usageData.series || []);
+  usFillAcctSelect('usChartAcct', usageData);
+  usRenderChart(usageData);
   renderUsageHours(usageData);
 }
 
@@ -3614,14 +3615,12 @@ if ($('usCreditTabs')) $('usCreditTabs').addEventListener('click', ev => {
   usCreditDim = b.dataset.dim;
   renderCreditDim();
 });
-// 「按小时」表的整体 / 按账号切换：只换渲染口径，不重新请求（同一份快照里两套数据都有）。
-if ($('usHourTabs')) $('usHourTabs').addEventListener('click', ev => {
-  const b = ev.target.closest('button[data-dim]');
-  if (!b) return;
-  usHourDim = b.dataset.dim;
-  $('usHourTabs').querySelectorAll('button').forEach(x => x.classList.toggle('on', x === b));
-  renderUsageHours(usageData || {});
-});
+// 账号筛选：时序图与按小时表各一个下拉，共用同一份选择（改哪个都同步重画两块，
+// 免得出现「表看 A、图看 B」）。同一份快照里两套数据都有，切换零请求。
+for (const id of ['usChartAcct', 'usHourAcct']) {
+  const el = $(id);
+  if (el) el.onchange = () => usSetAcct(el.value);
+}
 if ($('usSort')) $('usSort').onchange = () => {
   usSort = $('usSort').value;
   renderUsageDim();
@@ -3644,49 +3643,101 @@ if ($('usSort')) $('usSort').onchange = () => {
  * 与 hour 点在同一个连续轴上——日桶本来就是他那天所有小时的聚合。
  */
 
-/* renderUsageHours 填「积分与 token 按小时」表。两个视图共用一张表、零请求切换：
-   整体视图吃 series（hour 点一小时一行、day 点一行代表当天聚合）；按账号视图吃
-   series_by_account（同一时段里每个账号各占一行，带账号名与域）。此前这张表只有
-   静态表头、没有任何渲染代码，用户永远看到一张空表。
+/* renderUsageHours 填「积分与 token 按小时」表。表结构恒为「时段 × 一行」，账号由
+   表头下拉筛选（usAcctUID，'' = 全部账号）：选全部时吃 series（hour 点一小时一行、
+   day 点一行代表当天聚合），选某个号时吃 series_by_account 里该号的点。零请求切换，
+   两套数据在同一份快照里。
    token/积分 = 合计 Token ÷ 该时段实测扣除积分（兑换率），没有积分样本的时段留 —，
    不拿 0 顶替。 */
-let usHourDim = 'total';
+let usAcctUID = ''; // '' = 全部账号；时序图与按小时表共用这一个选择
 
 function renderUsageHours(d) {
   const body = $('usHourBody');
   if (!body) return;
-  const byAcct = usHourDim === 'account';
-  const head = $('usHourHead');
-  if (head) {
-    head.innerHTML = '<tr><th class="mark" aria-hidden="true"></th><th>时段</th>' +
-      (byAcct ? '<th>账号</th>' : '') +
-      '<th class="num">请求</th><th class="num">Prompt</th><th class="num">Completion</th>' +
-      '<th class="num">合计</th><th class="num">积分</th><th class="num">token/积分</th></tr>';
-  }
-  const rows = byAcct
-    ? usHourAccountRows((d && d.series_by_account) || [])
-    : usHourSeriesRows((d && d.series) || []);
-  body.innerHTML = rows.map(p => usHourRow(p, byAcct)).join('') ||
-    '<tr><td colspan="' + (byAcct ? 9 : 8) + '" class="empty">暂无数据</td></tr>';
+  usFillAcctSelect('usHourAcct', d);
+  const rows = usHourSeriesRows(usAcctSeries(d));
+  body.innerHTML = rows.map(usHourRow).join('') ||
+    '<tr><td colspan="8" class="empty">暂无数据</td></tr>';
 }
 
-/* usHourSeriesRows 整体视图的行：丢掉时间解析不出来的点，再按时间降序。
-   后端 series 是「日桶升序 + 小时桶升序」两段拼接，简单 reverse 对混合窗口会错序，
-   直接按时间戳降序排，与输入顺序解耦。 */
+/* usAcctSeries 按当前账号取点：'' = 全部账号（整体 series，后端已按账号求和），
+   否则该号在 series_by_account 里的点。 */
+function usAcctSeries(d) {
+  if (!d) return [];
+  if (!usAcctUID) return d.series || [];
+  return (d.series_by_account || []).filter(p => p && String(p.uid || '') === usAcctUID);
+}
+
+/* usAcctList 账号下拉的数据：uid + 显示名（昵称优先、uid 前 8 位兜底）+ 域。
+   合并「用量明细·按账号」与 series_by_account 两处（同一快照同源，合并只为不漏号），
+   按显示名排序——账号一多，按名字找比按用量排序好找。 */
+function usAcctList(d) {
+  const seen = new Map();
+  if (d) {
+    for (const r of d.by_account || []) {
+      const uid = String((r && r.key) || '');
+      if (!uid || seen.has(uid)) continue;
+      seen.set(uid, { uid, name: r.extra || uid.slice(0, 8), realm: r.realm || '' });
+    }
+    for (const p of d.series_by_account || []) {
+      const uid = String((p && p.uid) || '');
+      if (!uid || seen.has(uid)) continue;
+      seen.set(uid, { uid, name: p.nickname || uid.slice(0, 8), realm: p.realm || '' });
+    }
+  }
+  return Array.from(seen.values()).sort((a, b) => a.name.localeCompare(b.name));
+}
+
+/* usFillAcctSelect 重填账号下拉。选项集合没变就只校正选中项、不重建 options——
+   重建会把用户正展开的下拉关掉；只有号进出快照时才换选项。 */
+function usFillAcctSelect(id, d) {
+  const el = $(id);
+  if (!el) return;
+  const list = usAcctList(d);
+  const sig = list.map(a => a.uid + '\u0000' + a.name + '\u0000' + a.realm).join('\u0001');
+  if (el.dataset.acctSig !== sig) {
+    el.innerHTML = '<option value="">全部账号</option>' + list.map(a =>
+      '<option value="' + esc(a.uid) + '">' + esc(a.name) + '</option>').join('');
+    el.dataset.acctSig = sig;
+  }
+  // 选中的号不在本窗口里了（换窗口后没请求）：回到「全部账号」，别留一张空表。
+  if (usAcctUID && !list.some(a => a.uid === usAcctUID)) usAcctUID = '';
+  el.value = usAcctUID;
+}
+
+/* usAcctName 下拉里那个号的显示名，用于时序图说明行。 */
+function usAcctName(d, uid) {
+  const hit = usAcctList(d).find(a => a.uid === uid);
+  return hit ? hit.name : '';
+}
+
+/* usRenderChart 画时序图：按当前账号筛点后交给 renderUsageChart。选了账号就把账号名
+   缀在说明行前面——只剩几根柱子时，图上看不出是谁的。 */
+function usRenderChart(d) {
+  renderUsageChart(usAcctSeries(d));
+  if (usAcctUID && $('usChartNote')) {
+    const name = usAcctName(d, usAcctUID);
+    if (name) $('usChartNote').textContent = name + ' · ' + $('usChartNote').textContent;
+  }
+}
+
+/* usSetAcct 账号筛选的唯一入口：两个下拉共用一份选择，改哪个都重画两块——否则会
+   出现「表看 A、图看 B」的对不上，也没法一眼确认自己筛的是谁。 */
+function usSetAcct(uid) {
+  usAcctUID = uid || '';
+  const d = usageData || {};
+  usFillAcctSelect('usChartAcct', d);
+  usFillAcctSelect('usHourAcct', d);
+  usRenderChart(d);
+  renderUsageHours(d);
+}
+
+/* usHourSeriesRows 表的行：丢掉时间解析不出来的点，再按时间降序。整体与单账号点
+   都走这里——后端 series 是「日桶升序 + 小时桶升序」两段拼接，简单 reverse 对混合
+   窗口会错序，直接按时间戳降序排，与输入顺序解耦。 */
 function usHourSeriesRows(series) {
   const rows = [];
   for (const p of series) {
-    if (p && typeof p.t === 'string' && parsePointTime(p) !== null) rows.push(p);
-  }
-  rows.sort((a, b) => parsePointTime(b) - parsePointTime(a));
-  return rows;
-}
-
-/* usHourAccountRows 按账号视图的行：时段降序；同一时段内按合计 Token 降序——
-   多号集中烧号时，那一组里最花钱的号排最上面。 */
-function usHourAccountRows(points) {
-  const rows = [];
-  for (const p of points) {
     if (p && typeof p.t === 'string' && parsePointTime(p) !== null) rows.push(p);
   }
   rows.sort((a, b) => (parsePointTime(b) - parsePointTime(a)) ||
@@ -3694,22 +3745,13 @@ function usHourAccountRows(points) {
   return rows;
 }
 
-/* usHourRow 一行。byAcct 时多一列账号：昵称优先，缺省取 uid 前 8 位，下行小字补
-   域与 uid——与「积分扣除·按账号」表同一套写法，页面之间认人的方式要一致。 */
-function usHourRow(p, byAcct) {
+/* usHourRow 一行。账号不进列（由表头下拉筛选），所以列数与表头恒定一致。 */
+function usHourRow(p) {
   const tt = Number(p.total_tokens || 0);
   const cr = Number(p.credits || 0);
-  let acctCell = '';
-  if (byAcct) {
-    const uid = String(p.uid || '');
-    const name = p.nickname || uid.slice(0, 8) || '—';
-    acctCell = '<td>' + remarkName(uid, esc(name)) +
-      '<div class="note">' + esc(p.realm || '') + ' · ' + esc(uid.slice(0, 8)) + '</div></td>';
-  }
   return '<tr>' +
     '<td class="mark" aria-hidden="true"></td>' +
     '<td>' + esc(usHourLabel(p)) + '</td>' +
-    acctCell +
     '<td class="num">' + fmtTok(p.requests) + '</td>' +
     '<td class="num">' + fmtTok(p.prompt_tokens) + '</td>' +
     '<td class="num">' + fmtTok(p.completion_tokens) + '</td>' +

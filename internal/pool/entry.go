@@ -110,7 +110,7 @@ type Status struct {
 	// account_share），0 = 未配置。透出来是为了让配置能自证生效：uid 打错时这里恒 0。
 	Priority      int       `json:"priority,omitempty"`
 	Share         float64   `json:"share,omitempty"`
-	FocusLocked   bool      `json:"focus_locked,omitempty"` // 是否当前为快过期积分聚焦目标（pool.expiring_focus）
+	FocusLocked   bool      `json:"focus_locked,omitempty"` // 最近一次选号是否落在该号（pool.expiring_focus 观测，非锁定状态）
 	Cooling       bool      `json:"cooling"`
 	CoolKind      string    `json:"cool_kind,omitempty"`
 	CoolRemaining int64     `json:"cool_remaining_sec,omitempty"`

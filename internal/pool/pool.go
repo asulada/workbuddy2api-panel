@@ -114,12 +114,12 @@ type Pool struct {
 	// 7/3 同义，不必凑满 100）。缺省 nil = 全部未配置（行为与旧版一致）。
 	accountShare map[string]float64
 	// expiringFocus 快过期积分聚焦开关（SetExpiringFocus 注入，默认关）。
-	// 开启后把流量硬压到「窗口内快过期积分（creditsExpiring）最多」的账号，
-	// 把额度烧在过期前；关闭则完全回到既有加权路由。见 focus.go。
+	// 开启后把流量压到「最快到期」的账号，把额度烧在过期前；关闭则完全回到既有加权
+	// 路由。目标每次现算，不留状态。见 focus.go。
 	expiringFocus bool
-	// expiringFocusUID 聚焦目标锁定表（realm → uid）。**锁定而非每次现算**：
-	// 扣费会让 creditsExpiring 逐笔下降，现算最大值会让目标在两个号接近时反复
-	// 翻转，两边都烧不完（详见 focus.go 的说明）。运行态，不落 state.json。
+	// expiringFocusUID 观测：最近一次选号落在谁身上（realm → uid），**只供 Status 透出**
+	// （面板 focus_locked），不参与任何决策——判断目标永远现算（见 focus.go 顶部：删掉
+	// 锁的原因）。运行态，不落 state.json。
 	expiringFocusUID map[string]string
 	// expiringFocusDry 聚焦「本域一个候选都没有」的告警去抖（realm → 已告警）。
 	// 只把「功能静默停摆」变成一条可观测事件：某个 realm 从有候选变成零候选时打一条，

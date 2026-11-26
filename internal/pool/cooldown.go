@@ -194,9 +194,9 @@ func sanitizeExpiryBuckets(in []ExpiryBucket, now time.Time) []ExpiryBucket {
 // 调用点只有一条：focus.go 的「聚焦一个候选都选不出来」慢路径。正常情况走不到这里，
 // 所以热路径零成本。
 //
-// 必须回写而非只算局部值：交棒判定（focusCandidateLocked 上游的
-// `e.creditsExpiring <= 0`）、会话分配（realm.go 的 sessionFocusTargetLocked）和面板
-// 读的都是 entry 上的字段；只算一次局部值，锁定会在下一次请求就被判成「已烧光」而抖掉。
+// 必须回写而非只算局部值：选号（focusCandidateLocked 的 `e.creditsExpiring <= 0` 跳过）、
+// 会话分配（realm.go 的 NewSessionUIDsForModelRealm）和面板读的都是 entry 上的字段；
+// 只算一次局部值，下一次请求又会被判成「没有快过期积分」而空转。
 //
 // 两条保守：窗口 <= 0（未注入/禁用）或 buckets 为空（旧 state、只写过聚合字段的调用方）
 // 时原值返回不动——没有明细就无从重算，把字段清零反而会凭空关掉聚焦。调用方须持 p.mu。

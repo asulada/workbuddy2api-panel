@@ -104,12 +104,16 @@ func (p *Pool) WeightedAvailableUIDsForModelRealm(model, realm string) []string 
 // NewSessionUIDsForModelRealm 返回**新会话可分配**的账号列表（session 慢路径用）。
 //
 // 与 WeightedAvailableUIDsForModelRealm 的唯一差别：快过期聚焦（pool.expiring_focus）
-// 生效时只返回目标号。这样新会话必然落到目标号上，而**已绑定的老会话不受影响**——
-// 它们的可用性校验走 AvailableUIDsForModelRealm（不收窄），继续用原号直到 TTL 过期，
-// 之后按当时的聚焦目标重新分配。渐进迁移，避免切换瞬间全部会话前缀缓存 miss。
+// 生效时只返回「最快到期」的那个号。新会话因此必然落到它身上，而**已绑定的老会话不受
+// 影响**——它们的可用性校验走 AvailableUIDsForModelRealm（不收窄），继续用原号直到 TTL
+// 过期，之后按当时的焦点重新分配。渐进迁移，避免切换瞬间全部会话前缀缓存 miss。
+//
+// 每次都按当前快照现算，不读也不写任何「锁定」状态（focus.go 顶部解释了为什么删掉锁）：
+// 到期时刻不随花钱漂移，重算在快照变化前是稳定的；一旦这批烧光、或池里出现更快要过期
+// 的号，下一个新会话立刻改投它——这正是「先用快过期的积分」要的行为。
 //
 // 未开聚焦 / 无目标 / 显式配置（account_share、非 weighted 策略）让位时，与
-// WeightedAvailableUIDsForModelRealm 完全一致（聚焦的让位判定复用同一函数）。
+// WeightedAvailableUIDsForModelRealm 完全一致。
 func (p *Pool) NewSessionUIDsForModelRealm(model, realm string) []string {
 	out := p.WeightedAvailableUIDsForModelRealm(model, realm)
 	if len(out) <= 1 {
@@ -120,15 +124,34 @@ func (p *Pool) NewSessionUIDsForModelRealm(model, realm string) []string {
 	if !p.expiringFocus {
 		return out
 	}
-	uid := p.sessionFocusTargetLocked(model, realm)
-	if uid == "" {
+	// 让位判据与 focusExpiringLocked 同源：显式配置优先于自动聚焦。
+	if p.strategy != "" && p.strategy != StrategyWeighted {
 		return out
 	}
-	// 目标号在 out 里至少出现一次（重量列表按 slots 重复）：保留全部副本，
-	// 保持「虚拟实例权重」语义不变；目标号不可用时保持原列表，避免把新会话饿死。
+	for _, e := range p.byUID {
+		if p.shareOf(e.a.UID) > 0 {
+			return out
+		}
+	}
+	// 只在 out 上排序：out 已经过可用性/健康/在途/成本层过滤，故不必再判一次可用性。
+	var best *entry
+	for _, uid := range out {
+		e, ok := p.byUID[uid]
+		if !ok || e.creditsExpiring <= 0 {
+			continue // 窗口内没有快过期积分的号不参与
+		}
+		if best == nil || focusBetter(e, best) {
+			best = e
+		}
+	}
+	if best == nil {
+		return out // 没有任何号持有窗口内快过期积分：照常散列，别把新会话饿死
+	}
+	// 目标号在 out 里可能出现多次（虚拟实例权重按 slots 重复）：保留全部副本，
+	// 保持「虚拟实例权重」语义不变。
 	kept := make([]string, 0, len(out))
 	for _, u := range out {
-		if u == uid {
+		if u == best.a.UID {
 			kept = append(kept, u)
 		}
 	}
@@ -136,47 +159,6 @@ func (p *Pool) NewSessionUIDsForModelRealm(model, realm string) []string {
 		return out
 	}
 	return kept
-}
-
-// sessionFocusTargetLocked 返回快过期聚焦对**新会话**的分配目标；无目标返回空串。
-//
-// 与 pick 的 focusExpiringLocked 共用同一份锁定表（p.expiringFocusUID），但**不做
-// 交棒判定**：session 慢路径只在「没有可用绑定」时调用，此时若顺手改写锁定表，
-// 一个刚启动、余额还没刷新的进程会把锁定表写满错误目标。真正的交棒由 pick 负责
-// （它每笔请求都会跑，且能看到成本层/在途等完整上下文）。
-// 这里只回答「当前锁的是谁，它在这个模型上可用吗」，不可用就返回空串让新会话照常散列。
-// 调用方须持 p.mu。
-func (p *Pool) sessionFocusTargetLocked(model, realm string) string {
-	uid := p.expiringFocusUID[realm]
-	if uid == "" {
-		return ""
-	}
-	// 显式配置让位：与 focusExpiringLocked 同判据（占比按比例分，与独占互斥；
-	// 轮询/顺序耗尽的环也是显式配置）。这里只读锁定表，故用全集判断占比。
-	if p.strategy != "" && p.strategy != StrategyWeighted {
-		return ""
-	}
-	for _, e := range p.byUID {
-		if p.shareOf(e.a.UID) > 0 {
-			return ""
-		}
-	}
-	e, ok := p.byUID[uid]
-	if !ok {
-		return ""
-	}
-	now := time.Now()
-	if e.creditsExpiring <= 0 {
-		// 可能是真的烧光了，也可能只是快照滞后（批次刚滑进窗口）。这里在 RLock 下不能
-		// 回写，故直接返回空串让新会话照常散列；下一次请求的 pick 会在「全零」慢路径里
-		// 用批次明细把字段修正过来（见 refreshExpiringFromBucketsLocked），之后本函数
-		// 自然就能看到它。代价最多是一次新会话的落点不收敛。
-		return ""
-	}
-	if p.focusAccountUnusableLocked(e, now, model) {
-		return ""
-	}
-	return uid
 }
 
 // AvailableUIDsForModelRealm 同 AvailableUIDsForModel，但仅返回 Realm()==realm 的账号

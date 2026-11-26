@@ -29,64 +29,64 @@ func focusCredits(p *Pool, uid string, expiring int64, expiresIn time.Duration) 
 	p.SetCreditsDetailed(uid, credits, credits, expiring, at, expiring)
 }
 
-// TestExpiringFocusBurnsSingleAccount：开启后流量全部落到「窗口内快过期积分最多」的号，
-// 而不是余额最多的号——这正是它与加权路由的区别。
+// TestExpiringFocusBurnsSingleAccount：开启后流量全部落到「最快到期」的那个号，而不是
+// 余额最多的号——这正是它与加权路由的区别。
 func TestExpiringFocusBurnsSingleAccount(t *testing.T) {
 	withNoPickGap(t)
 	// 余额故意让 u0 最多：不开聚焦时 u0 才是加权首选（下面的基线用例会验证）。
 	p := mkPool(3, 100000, 1000, 1000)
-	focusCredits(p, "u1", 500, 48*time.Hour)
-	focusCredits(p, "u2", 100, 24*time.Hour)
+	focusCredits(p, "u1", 500, 24*time.Hour) // 最先到期
+	focusCredits(p, "u2", 100, 48*time.Hour)
 
 	p.SetExpiringFocus(true)
 	if got := pickAll(p, 50); got["u1"] != 50 {
-		t.Fatalf("聚焦应独占 u1（窗口内 500 分），实际 %v", got)
+		t.Fatalf("聚焦应独占最先到期的 u1，实际 %v", got)
 	}
 }
 
-// TestExpiringFocusPrefersAmountOverDeadline：金额是主轴。u2 先到期但只有 100 分，
-// u1 两天后才到期但有 500 分 —— 先烧 u1。这条同时钉住「本功能 ≠ expiringUrgency」：
-// 后者的倍率只由剩余时间决定，与金额无关。
-func TestExpiringFocusPrefersAmountOverDeadline(t *testing.T) {
+// TestExpiringFocusPrefersEarliestDeadline：到期时刻是主轴。u0 金额大但两天后才到期，
+// u1 只有 100 分但两小时后到期 —— 先烧 u1。这条同时钉住「本功能 ≠ expiringUrgency」：
+// 后者只把「窗口内有没有快过期批次」折成权重倍率，与金额、先后都无关。
+func TestExpiringFocusPrefersEarliestDeadline(t *testing.T) {
 	withNoPickGap(t)
 	p := mkPool(2, 1000, 1000)
 	focusCredits(p, "u0", 500, 72*time.Hour) // 金额大、到期晚
 	focusCredits(p, "u1", 100, 2*time.Hour)  // 金额小、先到期
 
 	p.SetExpiringFocus(true)
-	if got := pickAll(p, 40); got["u0"] != 40 {
-		t.Fatalf("金额多的 u0 应先被烧（哪怕 u1 更早到期），实际 %v", got)
+	if got := pickAll(p, 40); got["u1"] != 40 {
+		t.Fatalf("应先烧最快要到期的 u1（哪怕 u0 金额更多），实际 %v", got)
 	}
-	// 状态透出：哪个号被锁定必须可观测，否则「开了但不知道烧的是谁」。
-	if st, ok := p.Status("u0"); !ok || !st.FocusLocked {
-		t.Fatalf("u0 应标记 focus_locked，实际 %+v", st)
+	// 状态透出：现在烧的是谁必须可观测，否则「开了但不知道烧的是谁」。
+	if st, ok := p.Status("u1"); !ok || !st.FocusLocked {
+		t.Fatalf("u1 应标记 focus_locked，实际 %+v", st)
 	}
-	if st, ok := p.Status("u1"); !ok || st.FocusLocked {
-		t.Fatalf("u1 不该标记 focus_locked，实际 %+v", st)
+	if st, ok := p.Status("u0"); !ok || st.FocusLocked {
+		t.Fatalf("u0 不该标记 focus_locked，实际 %+v", st)
 	}
 }
 
-// TestExpiringFocusHandsOffWhenBurned：窗口内额度烧光（credits_expiring 归零）后自动
-// 交棒给下一个持有快过期积分的号。这是「锁定」语义能够自愈的关键——否则锁定号烧空后
-// 流量会一直压在它身上（余额还在，只是没有快过期额度了）。
+// TestExpiringFocusHandsOffWhenBurned：窗口内额度烧光（credits_expiring 归零）后，
+// 下一次选号自动落到下一个持有快过期积分的号上——不需要任何「交棒」判定，因为目标
+// 是现算的。这也是无锁设计的自愈点：烧空的号自然退出候选，流量不会一直压在它身上。
 func TestExpiringFocusHandsOffWhenBurned(t *testing.T) {
 	withNoPickGap(t)
 	p := mkPool(3, 1000, 1000, 1000)
-	focusCredits(p, "u1", 500, 48*time.Hour)
-	focusCredits(p, "u2", 300, 24*time.Hour)
+	focusCredits(p, "u1", 500, 24*time.Hour) // 最先到期
+	focusCredits(p, "u2", 300, 48*time.Hour)
 	p.SetExpiringFocus(true)
 
 	if got := pickAll(p, 10); got["u1"] != 10 {
-		t.Fatalf("应先锁 u1，实际 %v", got)
+		t.Fatalf("应先烧 u1，实际 %v", got)
 	}
 	// 模拟「u1 的窗口内批次已烧完」：余额仍在，只是 credits_expiring 归零。
 	focusCredits(p, "u1", 0, 0)
 	if got := pickAll(p, 10); got["u2"] != 10 {
-		t.Fatalf("u1 烧光后应交棒给 u2，实际 %v", got)
+		t.Fatalf("u1 烧光后应改烧 u2，实际 %v", got)
 	}
-	// 锁定表也跟着换人：u1 不再标记，u2 标记。
+	// 观测标记跟着换人：u1 不再标记，u2 标记。
 	if st, _ := p.Status("u1"); st.FocusLocked {
-		t.Fatalf("u1 交棒后不该仍标记 focus_locked: %+v", st)
+		t.Fatalf("u1 烧光后不该仍标记 focus_locked: %+v", st)
 	}
 	if st, _ := p.Status("u2"); !st.FocusLocked {
 		t.Fatalf("u2 应接任 focus_locked: %+v", st)
@@ -272,40 +272,38 @@ func TestSetExpiringFocusToggleClearsLock(t *testing.T) {
 	}
 }
 
-// TestExpiringFocusKeepsLockAcrossCostTiers：锁定号因成本分层暂时不在最优层时，
-// 既不该收窄（成本分层优先于聚焦），也不该交棒换人。否则「别的号出现免费观测」
-// 与「免费观测过期」交替发生时，目标会逐笔抖动——正是锁定语义要消除的形态。
-func TestExpiringFocusKeepsLockAcrossCostTiers(t *testing.T) {
+// TestExpiringFocusCostTierWins：成本分层优先于聚焦。快过期号因成本分层暂时不在最优层
+// 时，请求交给更便宜的层，不强行把流量拉回它；额度还在，层恢复或别的号不可用时它自然
+// 又被选中（目标现算，不需要「保锁」）。
+func TestExpiringFocusCostTierWins(t *testing.T) {
 	withNoPickGap(t)
 	p := mkPool(2, 1000, 1000)
-	p.SetCostExploreInterval(0) // 关掉 tier 探索改道：本用例只测分层与锁定
+	p.SetCostExploreInterval(0) // 关掉 tier 探索改道：本用例只测分层
 	focusCredits(p, "u0", 500, 48*time.Hour)
 	p.SetExpiringFocus(true)
 
 	if a := p.PickExcludingForModel(nil, "m"); a == nil || a.UID != "u0" {
-		t.Fatalf("应先锁 u0，实际 %v", a)
+		t.Fatalf("应先烧 u0，实际 %v", a)
 	}
-	// u1 实测免费 → tier 0 层只有 u1；u0 落在 tier 1。请求交给 u1（层优先），
-	// 但 u0 的快过期额度还在，锁定不能丢。
+	// u1 实测免费 → tier 0 层只有 u1；u0 落在 tier 1。请求交给 u1（层优先）。
 	p.NoteModelCost("u1", "m", 0, 100)
 	if a := p.PickExcludingForModel(nil, "m"); a == nil || a.UID != "u1" {
 		t.Fatalf("成本分层应优先（免费层 u1 接单），实际 %v", a)
 	}
-	if st, _ := p.Status("u0"); !st.FocusLocked {
-		t.Fatalf("换层不成交棒，u0 应保持 focus_locked: %+v", st)
+	// 本次没落到 u0，观测标记必须跟着走——否则面板会显示「正在烧 u0」而实际流量在别处。
+	if st, _ := p.Status("u0"); st.FocusLocked {
+		t.Fatalf("本次落点不是 u0，观测标记应已清掉: %+v", st)
 	}
-	// 层恢复同质（把 u1 的观测清掉——用移除再补回的等价形态：直接把 u1 挡在收费层）。
-	// 这里换个更直接的观察：u1 冷却后 u0 回到唯一候选，应立即继续烧 u0。
+	// u1 不可用后，快过期额度还在的 u0 立刻回到唯一候选。
 	p.Cooldown("u1", CoolSoft, time.Hour, "test")
 	if a := p.PickExcludingForModel(nil, "m"); a == nil || a.UID != "u0" {
-		t.Fatalf("u1 不可用后应继续烧锁定号 u0，实际 %v", a)
+		t.Fatalf("u1 不可用后应继续烧 u0，实际 %v", a)
 	}
 }
 
-// TestExpiringFocusKeepsLockWhenInFlightFull：锁定号只是「在途名额占满」时**不交棒**。
-// 这是高并发下的常态（max_in_flight 默认 3）：若把临时让位当成交棒信号，目标会被反复
-// 清空重选，聚焦直接退化成普通加权——正好是本功能要避免的结果。
-func TestExpiringFocusKeepsLockWhenInFlightFull(t *testing.T) {
+// TestExpiringFocusInFlightFullYieldsThenReturns：目标号只是在途名额占满时，本次请求让给
+// 同层其他号（不能把请求饿死），名额一释放立刻回到目标号——目标是现算的，不需要「保锁」。
+func TestExpiringFocusInFlightFullYieldsThenReturns(t *testing.T) {
 	withNoPickGap(t)
 	p := mkPool(2, 1000, 1000)
 	focusCredits(p, "u0", 500, 48*time.Hour)
@@ -313,22 +311,19 @@ func TestExpiringFocusKeepsLockWhenInFlightFull(t *testing.T) {
 	p.SetMaxInFlight(1)
 
 	if a := p.Pick(); a == nil || a.UID != "u0" {
-		t.Fatalf("应先锁 u0，实际 %v", a)
+		t.Fatalf("应先烧 u0，实际 %v", a)
 	}
-	// 把 u0 的在途名额占满 → 本轮只能给 u1，但锁定必须保住。
+	// 把 u0 的在途名额占满 → 本轮只能给 u1。
 	if !p.Acquire("u0") {
 		t.Fatal("Acquire(u0) 应成功")
 	}
 	if a := p.Pick(); a == nil || a.UID != "u1" {
 		t.Fatalf("u0 在途满时应临时让位给 u1，实际 %v", a)
 	}
-	if st, _ := p.Status("u0"); !st.FocusLocked {
-		t.Fatalf("在途占满不成交棒，u0 应保持 focus_locked: %+v", st)
-	}
-	// 名额释放 → 立刻回到锁定号，而不是重新挑一个。
+	// 名额释放 → 立刻回到快过期号，而不是停在 u1。
 	p.Release("u0")
 	if a := p.Pick(); a == nil || a.UID != "u0" {
-		t.Fatalf("名额释放后应回到锁定号 u0，实际 %v", a)
+		t.Fatalf("名额释放后应回到 u0，实际 %v", a)
 	}
 }
 
@@ -357,7 +352,7 @@ func TestExpiringFocusHandsOffOnReserveBlocked(t *testing.T) {
 	}
 }
 
-// TestNewSessionUIDsConvergeToFocusTarget：新会话分配池只含聚焦目标号，
+// TestNewSessionUIDsConvergeToFocusTarget：新会话分配池只含最快到期的那个号，
 // 而「已绑定会话可用性校验」用的列表（AvailableUIDsForModelRealm）保持全量。
 // 两者必须分开：前者决定新会话去哪，后者决定老会话是否还合法——合并任一侧都会错。
 func TestNewSessionUIDsConvergeToFocusTarget(t *testing.T) {
@@ -367,12 +362,7 @@ func TestNewSessionUIDsConvergeToFocusTarget(t *testing.T) {
 	p.SetExpiringFocus(true)
 	p.SetPreferExpiring(false, 0) // 关掉虚拟实例权重，让列表长度可比
 
-	// 先跑一次 pick 建立锁定（session 慢路径刻意不改写锁定表）。
-	p.Pick()
-	if st, _ := p.Status("u1"); !st.FocusLocked {
-		t.Fatalf("pick 后应锁定 u1: %+v", st)
-	}
-
+	// 不需要先跑一次 pick：目标现算，新会话直接就能收敛。
 	newSessions := p.NewSessionUIDsForModelRealm("m", "")
 	if len(newSessions) == 0 {
 		t.Fatal("新会话分配池不该为空")
@@ -385,6 +375,28 @@ func TestNewSessionUIDsConvergeToFocusTarget(t *testing.T) {
 	// 老会话的校验集必须仍是全量。
 	if got := n(p.AvailableUIDsForModelRealm("m", "")); len(got) != 3 {
 		t.Fatalf("老会话校验集必须保持全量（否则会瞬间全量迁移），实际 %v", got)
+	}
+}
+
+// TestNewSessionFollowsEarliestDeadline：每个新会话都按**当下**的快照重算，不沿用上一次的
+// 选择。所以池里一旦出现更快要过期的号，下一个新会话立刻改投它，不必等前一个烧完。
+// 这正是「先用快过期的积分」而不是「锁定某个账号」的分界线。
+func TestNewSessionFollowsEarliestDeadline(t *testing.T) {
+	withNoPickGap(t)
+	p := mkPool(3, 1000, 1000, 1000)
+	p.SetExpiringFocus(true)
+	p.SetPreferExpiring(false, 0)
+	focusCredits(p, "u1", 900, 72*time.Hour) // 金额大、到期远
+	focusCredits(p, "u2", 100, 48*time.Hour) // 金额小、先到期
+
+	if got := n(p.NewSessionUIDsForModelRealm("m", "")); len(got) != 1 || !got["u2"] {
+		t.Fatalf("新会话应先分给最快要到期的 u2，实际 %v", got)
+	}
+	// u1 的批次变成更快到期（比如签到又补了一批 2 小时后到期的）→ 不用等 u2 烧完，
+	// 下一个新会话就该改投 u1。
+	focusCredits(p, "u1", 900, 2*time.Hour)
+	if got := n(p.NewSessionUIDsForModelRealm("m", "")); len(got) != 1 || !got["u1"] {
+		t.Fatalf("出现更快要到期的号后，新会话应立刻改投 u1，实际 %v", got)
 	}
 }
 
@@ -465,14 +477,14 @@ func TestExpiringFocusSlowPathSeesBucketCrossedIntoWindow(t *testing.T) {
 
 // TestExpiringFocusSlowPathClampsBucketSumToCredits：上游「总余额已扣、批次明细没跟着
 // 扣」时批次合计会大于余额，重算必须按 SetCreditsSnapshot 同一口径钳到 credits，
-// 否则脏数据直接决定「谁金额最多」。
+// 否则脏数据直接决定目标（两个号到期时刻相同，此时比的就是金额）。
 func TestExpiringFocusSlowPathClampsBucketSumToCredits(t *testing.T) {
 	withNoPickGap(t)
 	p := mkPool(3, 1000, 1000, 1000)
 	p.SetPreferExpiring(true, 48*time.Hour)
-	at := time.Now().Add(12 * time.Hour)
-	focusBucket(p, "u1", 400, at, 900)                 // 脏：批次 900 > 余额 400
-	focusBucket(p, "u2", 1000, at.Add(time.Hour), 500) // 干净：500
+	at := time.Now().Add(12 * time.Hour) // 两个号同一到期时刻
+	focusBucket(p, "u1", 400, at, 900)   // 脏：批次 900 > 余额 400
+	focusBucket(p, "u2", 1000, at, 500)  // 干净：500
 	p.SetExpiringFocus(true)
 
 	if got := pickAll(p, 20); got["u2"] != 20 {

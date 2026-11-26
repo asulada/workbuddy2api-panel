@@ -1422,6 +1422,9 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
             <div class="uschart-hd">
               <span class="lb">Token 时序</span>
               <span class="note" id="usChartNote">—</span>
+              <label class="sel-note">账号
+                <select id="usChartAcct" aria-label="按账号筛选时序"></select>
+              </label>
               <span class="grow"></span>
               <span class="legend"><i class="sw sw-p"></i>prompt<i class="sw sw-c"></i>completion<span class="sep"></span><i class="sw sw-hit"></i>缓存命中率<i class="sw sw-t"></i>均值</span>
             </div>
@@ -1432,10 +1435,9 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
 
       <div class="box">
         <header><h3>积分与 token 按小时</h3>
-          <span class="vtabs" id="usHourTabs">
-            <button data-dim="total" class="on">整体</button>
-            <button data-dim="account">按账号</button>
-          </span>
+          <label class="sel-note">账号
+            <select id="usHourAcct" aria-label="按账号筛选按小时表"></select>
+          </label>
           <span class="grow"></span>
           <span class="note">积分取上游 usage.credit（没观测到的请求不计）；兑换率 = token ÷ 积分</span></header>
         <div class="tbl-wrap">
@@ -1775,7 +1777,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
               <input type="checkbox" name="prefer_expiring"></div>
             <div class="switch"><span class="lb">快过期积分聚焦（独占单号）</span>
               <input type="checkbox" name="expiring_focus">
-              <span class="hint">开启后把流量硬压到「上面窗口内快过期积分最多」的一个账号，烧光或不可用才换下一个。显式 account_priority / account_share / 非 weighted 选号策略存在时自动让位</span></div>
+              <span class="hint">开启后把流量压到「上面窗口内最快要到期」的一个账号，烧光或出现更快要过期的号时下一次选号就换人（每次现算，不锁号）。显式 account_priority / account_share / 非 weighted 选号策略存在时自动让位</span></div>
           </div>
         </div>
 

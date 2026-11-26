@@ -549,12 +549,16 @@ type Config struct {
 		AccountPriority map[string]int     `json:"account_priority"`
 		AccountShare    map[string]float64 `json:"account_share"`
 		// ExpiringFocus 快过期积分聚焦（默认 false = 关闭，零行为变化）。
-		// 开启后把流量**硬压**到「expiring_soon 窗口内快过期积分（credits_expiring）最多」的
-		// 那个账号上，让这批额度在过期前被烧掉；该号不可用或窗口内额度烧光后自动交棒给下一个。
+		// 开启后把流量压到「expiring_soon 窗口内**最快要到期**的那个账号」上，让这批额度
+		// 在过期前被烧掉；它窗口内的额度烧光、或池里出现更快要过期的号，下一次选号就换人。
+		//
+		// 目标是每次选号现算的，不保存「锁定」状态：到期时刻不随花钱漂移，所以重算不会
+		// 逐笔翻转；而一旦出现更紧急的号，新会话立刻改投它（若用锁定，就得等前一个烧完）。
 		//
 		// 与 prefer_expiring 的分工（两者可同时开，不冲突）：
-		//   prefer_expiring  软加权：倍率只按「剩余时间」算，多号同时命中窗口时按概率分摊；
-		//   expiring_focus   硬分层：按「金额」选唯一目标并独占，直到把它的窗口内额度烧光。
+		//   prefer_expiring  软加权：把「窗口内有没有快过期批次」折成倍率，多号同时命中时
+		//                    按概率分摊，不排序、不看金额；
+		//   expiring_focus   硬优先级：按「到期时刻」选唯一目标并独占，直到把它烧光。
 		// 优先级：显式配置一律压过它——account_priority（先烧层）、account_share（占比）、
 		// selection_strategy（非 weighted）任一存在时本功能整体让位。
 		// 代价（有意为之）：集中期间其余账号分不到轮换流量、长期积分不动；这正是

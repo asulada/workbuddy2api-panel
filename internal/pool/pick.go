@@ -175,17 +175,17 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
 	//   - 排在 top5 截断之前：目标号可能权重排在第 6 名开外（余额少但快过期积分多，
 	//     正是本功能最想烧的那种号），截断后再聚焦等于永远够不着。
 	// 收窄时保持 ws 原序（聚焦结果是单元素，序无意义；未收窄时一个都不动）。
-	// 条件写 `> 0` 而不是 `> 1`：即使只剩一个候选，也要跑一次本逻辑来**维护锁定状态**。
-	// 只剩单候选时收窄没有意义（结果还是它），但跳过会让「锁定号已停牌/已移除」这类
-	// 账号级不可用永远得不到判定——候选长期只有一个号时，focus_locked 会一直挂在那个
-	// 已经不该锁的号上，运维看到的观测值是假的。
+	// 条件写 `> 0` 而不是 `> 1`：即使只剩一个候选，也要跑一次本逻辑来**维护观测标记**。
+	// 只剩单候选时收窄没有意义（结果还是它），但跳过会让「本次根本没落到任何快过期号
+	// 上」这种情况得不到判定——候选长期只剩一个普通号时，focus_locked 会一直挂在上一
+	// 次选中的号上，运维看到的观测值是假的。
 	if p.expiringFocus && len(ws) > 0 {
 		entries := make([]*entry, len(ws))
 		for i := range ws {
 			entries[i] = ws[i].e
 		}
 		// all 传成本分层前的全集（此刻 cands 尚未被 ws 覆盖），见 focus.go 的说明。
-		if kept := p.focusExpiringLocked(entries, cands, realm, reqModel, now); len(kept) < len(entries) {
+		if kept := p.focusExpiringLocked(entries, cands, realm, now); len(kept) < len(entries) {
 			keep := make(map[string]bool, len(kept))
 			for _, e := range kept {
 				keep[e.a.UID] = true
