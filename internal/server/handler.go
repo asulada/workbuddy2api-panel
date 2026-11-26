@@ -1924,6 +1924,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			cont := newContinueReaderWithFloor(r.Context(), h.cfg.Upstream, acct, body, clientIP, chatMeta, rc,
 				h.cfg.Upstream.OutputBudgetFloor(acct.Realm(), curModel, hopTiming.Effort))
 			cont.narrationOff = h.loadLive().NarrationOff
+			cont.starvedOff = h.loadLive().StarvedOff
 			defer cont.Close()
 			stats := newChatStatsReaderSince(cont, st.start)
 			// gateway_hint（SSE）：成功状态 200 已开流，中途 error 帧透传时附加
@@ -2130,7 +2131,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		// billUsage 救援重发成功时两次调用 usage 的纯求和（记账口径，与流式 continueReader.billed
 		// 同理）：被丢弃的首个聚合体也是一次计费的上游调用。nil = 只有一次调用，按 resp 记。
 		var billUsage map[string]any
-		if aggregateStarved(resp) && bodyHasOutputLimit(body) {
+		// 开关关着（features.starved_rescue_enabled=false）时整段跳过：零正文聚合体原样交给
+		// 下面，客户端拿到「上游给什么就是什么」的结果（空 content / empty_reasoning_only）。
+		if !h.loadLive().StarvedOff && aggregateStarved(resp) && bodyHasOutputLimit(body) {
 			if rb, ok := starvedRetryBodyWithFloor(body, h.cfg.Upstream.OutputBudgetFloor(acct.Realm(), curModel, hopTiming.Effort)); ok {
 				if rc2, st2, _, e2 := h.cfg.Upstream.ChatStreamContext(r.Context(), acct, rb, clientIP, chatMeta, nil); e2 == nil && st2 < 400 && rc2 != nil {
 					if resp2, e3 := upstream.Aggregate(rc2); e3 == nil {

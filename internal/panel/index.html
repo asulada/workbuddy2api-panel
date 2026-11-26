@@ -1842,6 +1842,13 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
               该敏感字段不在本页面表单里，保存面板配置后热生效。只有自动签发不可用或已关闭、且没有手工凭证时，
               才会回 503 <code>three_d_credential_missing</code>。自动签发开关需手工修改
               <code>features.three_d_auto_token</code> 并重启。</div>
+            <div class="switch"><span class="lb">空截断救援（关思考重发）</span>
+              <input type="checkbox" name="starved_rescue_enabled"></div>
+            <div class="hint">默认开启。上游只吐思考、正文 0 字节时（<code>finish_reason=stop</code> 或 <code>length</code>），
+              网关关思考、同额度重发一次把这一轮救回来——不救时 <code>/v1/responses</code> 会判
+              <code>empty_reasoning_only</code> 回 502。代价是「这一轮的回答没有思考过」（首段思考既不回传也不复用），
+              而且这个形态会成簇出现：一段时间内每条都中，那段会话因此整段静默降级成无思考回答。
+              关掉后空正文原样收尾，由客户端自己判断要不要重试。改动即时生效。</div>
             <div class="switch"><span class="lb">会话粘性路由</span>
               <input type="checkbox" name="session_sticky_enabled"></div>
             <div class="hint" style="margin-top:10px">Upstash Redis 镜像、凭证目录与状态文件路径需手工编辑配置文件（判为重启项）。</div>

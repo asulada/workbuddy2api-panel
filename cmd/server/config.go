@@ -364,6 +364,17 @@ type Config struct {
 		// 就停」，同一请求不再多付一次整段 prompt。热生效（livecfg 快照）。
 		NarrationEnabled bool `json:"narration_enabled"`
 
+		// StarvedRescueEnabled 空截断救援（上游只吐思考、正文 0 字节时关思考同额度重发一次）
+		// 的总开关，缺省 true。
+		//
+		// 为什么给开关：这条救援不往对话里插任何东西，但它把这一轮的回复换成「没思考过的
+		// 裸答」——思考段既不回传也不复用（见 internal/server/starved.go 的说明）。而上游
+		// 这个形态实测会成簇出现：命中时间较固定，一段几分钟内每条都中。那段会话因此整段
+		// 静默降级成无思考回答，客户端看不到任何提示。默认开启是因为不救时客户端拿到的是
+		// 空回复或 502（/v1/responses 判 empty_reasoning_only）；宁可中断自己判断的部署关掉
+		// 即可，关后行为回到「上游给什么就是什么」。热生效（livecfg 快照）。
+		StarvedRescueEnabled bool `json:"starved_rescue_enabled"`
+
 		// BusyRetry 6020/6021 渠道排队时，先在网关内按上游 retry_after 等一轮再试一次，
 		// 避免把「等 40 秒就好」的排队当成不可重试错误甩给客户端（默认 true）。
 		BusyRetry bool `json:"busy_retry"`
@@ -708,6 +719,8 @@ func Default() *Config {
 	c.Features.BusyWaitSeconds = 60
 	// 预告式收尾救援缺省开启（issue #245 的长会话断写靠它）；agent 客户端可关（#273）。
 	c.Features.NarrationEnabled = true
+	// 空截断救援缺省开启：不救时空回复/502；想「宁可中断也别给无思考回答」的部署关掉。
+	c.Features.StarvedRescueEnabled = true
 	// 加号绑定号池出口缺省开启：登录也走代理，落盘后钉成该号的固定绑定。
 	// 显式 false 回到「登录直连」，供出口不支持登录域名的部署（如只放行 workbuddy.cn
 	// 的线路登录 codebuddy.ai 站点会 503）按需关掉。

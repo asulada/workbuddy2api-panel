@@ -50,6 +50,10 @@ func TestConfigExampleIsValid(t *testing.T) {
 	if !c.Features.NarrationEnabled {
 		t.Error("features.narration_enabled 示例值应为 true（默认开启）")
 	}
+	// 空截断救援同样默认开、同样可以关：示例里也要看得见，否则用户改不了。
+	if !c.Features.StarvedRescueEnabled {
+		t.Error("features.starved_rescue_enabled 示例值应为 true（默认开启）")
+	}
 	// 加号绑定号池出口默认开：示例里必须看得见，否则用户不知道登录本身也走代理池。
 	if !c.Features.LoginBindProxy {
 		t.Error("features.login_bind_proxy 示例值应为 true（默认开启）")

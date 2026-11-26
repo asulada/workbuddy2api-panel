@@ -25,6 +25,14 @@ type Snapshot struct {
 	// NarrationOff 预告式收尾救援是否被关闭（features.narration_enabled 取反）。
 	// 取反是为了让零值 = 开启：没接 livecfg 的裸用/测试路径不必初始化就保持既有行为。
 	NarrationOff bool
+	// StarvedOff 空截断救援是否被关闭（features.starved_rescue_enabled 取反）。
+	// 同样取反让零值 = 开启：裸用/测试路径不必初始化就保持既有行为。
+	//
+	// 这条救援的形态是「上游只吐思考、正文 0 字节」时关思考同额度重发一次。它不往对话里
+	// 插任何东西（不像 NarrationOff 那条），但代价是**这一轮回答变成没思考过的产物**，
+	// 而该形态实测会成簇出现（一段时间内每条都中），那段会话就整段静默降级。
+	// 宁可中断自己判断的部署可以关掉。
+	StarvedOff bool
 	// LoginBindOff 加号（OAuth 登录）是否**不**绑定号池出口（features.login_bind_proxy
 	// 取反）。取反是为了让零值 = 绑定：没接 livecfg 的裸用/测试路径不必初始化就保持
 	// 默认行为（登录经号池出口，落盘后钉成该号的固定绑定）。

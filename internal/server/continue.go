@@ -196,6 +196,9 @@ type continueReader struct {
 	// narrationOff features.narration_enabled=false：整条预告式收尾救援不发起（issue #273）。
 	// 生产路径在 handler 建 reader 时按 livecfg 快照赋值；零值 = 开启。
 	narrationOff bool
+	// starvedOff features.starved_rescue_enabled=false：整条空截断救援不发起（同 narrationOff，
+	// 零值 = 开启）。生产路径在 handler 建 reader 时按 livecfg 快照赋值。
+	starvedOff bool
 
 	// rescueWhy 本轮被挡掉的救援判据（枚举码，见 rescue_trace.go）：默认不记录，
 	// 只在 WB2API_RESCUE_TRACE=1 时有值。

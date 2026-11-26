@@ -1994,6 +1994,9 @@ const CFG_MAP = {
   sanitize_brand_scope: ['features', 'sanitize_brand_scope'],
   embeddings_enabled: ['features', 'embeddings_enabled'],
   three_d_enabled: ['features', 'three_d_enabled'],
+  // 空截断救援开关（features.starved_rescue_enabled）：热生效，热应用在 main 的
+  // live.Store 重建快照里，故不在 restartRequiredFields 名单内。
+  starved_rescue_enabled: ['features', 'starved_rescue_enabled'],
   session_sticky_enabled: ['session_sticky', 'enabled'],
   request_client_info: ['logging', 'request_client_info'],
   request_archive_context: ['logging', 'request_archive_context'],

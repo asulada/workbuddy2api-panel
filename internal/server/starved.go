@@ -168,17 +168,29 @@ func (r *continueReader) tryStarvedRetry() bool {
 	case r.atSegmentCap():
 		return false
 	}
+	// 成因要在重置 r.finish 之前抓：下面马上把它清空给新段用。
+	cause := "预算被思考吃光"
+	if r.finish != "length" {
+		cause = "思考完直接收尾"
+	}
+	if r.starvedOff {
+		// features.starved_rescue_enabled=false：形态确实命中了，但使用者要的是
+		// 「这一轮宁可中断也别给没思考过的答复」——不救，但必须留一行 WARN。
+		//
+		// 位置放在判据之后而不是开关一进来就判：这个形态每轮都可能出现，若把
+		// starvedOff 放在 switch 首格，连「正常答完、根本不需要救」的请求也会撞上，
+		// WARN 就变成每个请求一行的噪音，反而看不出真正被放弃的轮次。
+		// 只命中形态才打，才能回答「关掉以后到底放弃了多少次本该救的请求」。
+		log.Printf("WARN: [starved] acct=%s model=%s seg=%d %s（正文 0B）→ 救援已关闭（features.starved_rescue_enabled=false），按上游原样收尾，客户端将收到空正文/empty_reasoning_only",
+			logfmt.Label(r.acct.UID, r.acct.Nickname), bareModelOf(r.body), r.seg+1, cause)
+		return r.skip("starved", "off")
+	}
 	body, ok := starvedRetryBodyWithFloor(r.body, r.budgetFloor)
 	if !ok {
 		return false
 	}
 	r.starvedTried = true
 	noteRescue("starved")
-	// 成因要在重置 r.finish 之前抓：下面马上把它清空给新段用。
-	cause := "预算被思考吃光"
-	if r.finish != "length" {
-		cause = "思考完直接收尾"
-	}
 	// 异步换段：等待期内客户端只会收到 keepalive（见 openSegmentAsync）。
 	return r.openSegmentAsync(switchStarved, body, func(rc io.ReadCloser) {
 		r.seg++

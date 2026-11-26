@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/misakano7545/workbuddy2api-panel/internal/auth"
+	"github.com/misakano7545/workbuddy2api-panel/internal/livecfg"
 	"github.com/misakano7545/workbuddy2api-panel/internal/upstream"
 )
 
@@ -110,6 +111,100 @@ func TestChatNoRescueWhenToolCallsSeen(t *testing.T) {
 	_, _ = io.ReadAll(r)
 	if len(*reqs) != 0 {
 		t.Fatalf("工具轮不应重发，实际 %d 次", len(*reqs))
+	}
+}
+
+// TestChatNoRescueWhenStarvedOff features.starved_rescue_enabled=false 时整条救援不发起：
+// 上游只吐思考就直接 stop，这一轮就以空正文收尾，而不是换一份没思考过的回答顶上。
+// 使用者要的正是这个——命中会成簇，宁可中断自己判断，也不要一段静默降级的会话。
+func TestChatNoRescueWhenStarvedOff(t *testing.T) {
+	buf := captureLog(t)
+	up, reqs := fakeContinueUpstream(t, func(call int) (int, string) { return 200, testSeg2Text })
+	r := newContinueReaderWithFloor(context.Background(), up,
+		&auth.Auth{UID: "u1", AccessToken: "at-1", ExpiresAt: 9999999999},
+		[]byte(`{"model":"cn:deepseek-v4.1-flash","max_tokens":4096,"reasoning_effort":"high","messages":[{"role":"user","content":"hi"}]}`),
+		"1.2.3.4", upstream.ChatMeta{}, io.NopCloser(strings.NewReader(segReasoningOnlyStop)), 8192)
+	r.starvedOff = true
+	out, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if len(*reqs) != 0 {
+		t.Fatalf("开关关着不该重发，实际 %d 次", len(*reqs))
+	}
+	if strings.Contains(string(out), "继续") {
+		t.Fatalf("不该看到救援段正文:\n%s", out)
+	}
+	// 不救不等于不留痕：客户端这一段会拿到空正文，日志里必须能对上账。
+	logs := buf.String()
+	if !strings.Contains(logs, "WARN: [starved]") || !strings.Contains(logs, "救援已关闭") {
+		t.Fatalf("命中形态但救援被关掉时应打一行 WARN，实际日志:\n%s", logs)
+	}
+}
+
+// TestChatStarvedOffQuietUnlessShapeHits 开关关着、但这一轮是正常答完的（有正文、
+// finish=stop）：不能打「救援已关闭」。否则每个请求一行 WARN，反而看不出真正被
+// 放弃的轮次——这正是把开关判据放到形态判据之后的原因。
+func TestChatStarvedOffQuietUnlessShapeHits(t *testing.T) {
+	buf := captureLog(t)
+	up, reqs := fakeContinueUpstream(t, func(call int) (int, string) { return 200, testSeg2Text })
+	r := newContinueReaderWithFloor(context.Background(), up,
+		&auth.Auth{UID: "u1", AccessToken: "at-1", ExpiresAt: 9999999999},
+		[]byte(`{"model":"cn:deepseek-v4.1-flash","max_tokens":4096,"reasoning_effort":"high","messages":[{"role":"user","content":"hi"}]}`),
+		"1.2.3.4", upstream.ChatMeta{}, io.NopCloser(strings.NewReader(testSeg1Text)), 8192)
+	r.starvedOff = true
+	if _, err := io.ReadAll(r); err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if len(*reqs) != 0 {
+		t.Fatalf("正常答完的轮次不该重发，实际 %d 次", len(*reqs))
+	}
+	if logs := buf.String(); strings.Contains(logs, "救援已关闭") {
+		t.Fatalf("正常答完不该打救援告警:\n%s", logs)
+	}
+}
+
+// TestChatNonStreamNoRescueWhenStarvedOff 非流式这一侧同一开关：handler 里那段
+// aggregateStarved 分支被整段跳过，客户端拿到空正文聚合体而不是救援后的内容。
+func TestChatNonStreamNoRescueWhenStarvedOff(t *testing.T) {
+	up, reqs := fakeContinueUpstream(t, func(call int) (int, string) { return 200, testSeg2Text })
+	up.HTTP.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		raw, _ := io.ReadAll(r.Body)
+		*reqs = append(*reqs, string(raw))
+		body := segReasoningOnlyStop
+		if len(*reqs) > 1 {
+			body = testSeg2Text
+		}
+		return &http.Response{
+			StatusCode: 200,
+			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+			Body:       io.NopCloser(strings.NewReader(body)),
+		}, nil
+	})
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	h := NewHandler(Config{Pool: p, Upstream: up, Live: livecfg.New(livecfg.Snapshot{StarvedOff: true})})
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(
+		`{"model":"cn:deepseek-v4.1-flash","stream":false,"max_tokens":4096,"reasoning_effort":"high","messages":[{"role":"user","content":"hi"}]}`)))
+
+	if len(*reqs) != 1 {
+		t.Fatalf("上游调用=%d want 1（开关关着，非流式也不该重发）", len(*reqs))
+	}
+	if rec.Code != 200 {
+		t.Fatalf("状态码=%d want 200（不救援就把上游这份聚合体交给客户端）\n%s", rec.Code, rec.Body.String())
+	}
+	var got map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("响应非法: %v\n%s", err, rec.Body.String())
+	}
+	choices, _ := got["choices"].([]any)
+	if len(choices) == 0 {
+		t.Fatalf("响应缺 choices:\n%s", rec.Body.String())
+	}
+	msg, _ := choices[0].(map[string]any)["message"].(map[string]any)
+	if s, _ := msg["content"].(string); strings.Contains(s, "继续") {
+		t.Fatalf("不该出现救援段正文: %q", s)
 	}
 }
 
