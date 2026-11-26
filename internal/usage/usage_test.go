@@ -56,6 +56,52 @@ func TestAddAndTotals(t *testing.T) {
 	}
 }
 
+// SeriesByAccount 是「积分与 token 按小时」表**按账号**视图的数据源：同一时段里
+// 每个账号各一个点，昵称与域随点带出；顺序与 Series 同口径（日点在前、各自按时间
+// 升序），同一时段内按合计 Token 降序。
+func TestSnapshotSeriesByAccount(t *testing.T) {
+	r := New("")
+	now := time.Now()
+	r.Add(now, "cn", "u1", "m", Delta{PromptTokens: 100, CompletionTokens: 50, HasPromptTokens: true, HasCompletion: true, Credit: 2, HasCredit: true}, true)
+	r.Add(now, "cn", "u2", "m", Delta{PromptTokens: 10, CompletionTokens: 5, HasPromptTokens: true, HasCompletion: true}, true)
+	old := time.Now().AddDate(0, 0, -100) // 折叠成日桶，用来确认日点也按账号拆
+	r.Add(old, "cn", "u3", "m", Delta{PromptTokens: 7, HasPromptTokens: true}, true)
+	r.Rollup(time.Now())
+
+	all := r.Snapshot(0, map[string]string{"u1": "小号A"})
+	if len(all.SeriesByAccount) != 3 {
+		t.Fatalf("series_by_account = %+v, want 3 点（日桶 u3 + 小时桶 u1/u2）", all.SeriesByAccount)
+	}
+	if p := all.SeriesByAccount[0]; p.Scope != "day" || p.UID != "u3" || p.PromptTokens != 7 {
+		t.Fatalf("首点 = %+v, want 日桶 u3 pt=7（与 Series 一样日点在前）", p)
+	}
+	// 同一小时里合计 Token 大的排前面：u1 150 > u2 15。
+	h1, h2 := all.SeriesByAccount[1], all.SeriesByAccount[2]
+	if h1.Scope != "hour" || h1.UID != "u1" || h2.UID != "u2" || h1.T != h2.T {
+		t.Fatalf("小时点 = %+v / %+v, want 同一时段的 u1 在前、u2 在后", h1, h2)
+	}
+	if h1.Nickname != "小号A" || h1.Realm != "cn" {
+		t.Fatalf("u1 点 = %+v, want 昵称与域随点带出", h1)
+	}
+	if h1.TotalTokens != 150 || h1.Credits != 2 || h1.CreditSamples != 1 {
+		t.Fatalf("u1 点 = %+v, want tt=150 credits=2 samples=1（与按账号合计同源）", h1)
+	}
+
+	// 口径必须与整体 series 对得上：同一小时里各账号的点加起来 == 该小时的整体点。
+	win := r.Snapshot(24, nil)
+	if len(win.SeriesByAccount) != 2 || len(win.Series) != 1 {
+		t.Fatalf("24h 窗口 series/series_by_account = %d/%d, want 1/2（窗口外的日桶两端都不进）",
+			len(win.Series), len(win.SeriesByAccount))
+	}
+	var sum int64
+	for _, p := range win.SeriesByAccount {
+		sum += p.TotalTokens
+	}
+	if sum != win.Series[0].TotalTokens {
+		t.Fatalf("按账号合计 %d != 整体 %d（两份账对不上）", sum, win.Series[0].TotalTokens)
+	}
+}
+
 // Rollup 把超出 hourlyKeep 的小时桶折叠为日桶，且幂等：重复折叠不重复计数。
 // 窗口口径：24h 窗口不含 100 天前的日桶；hours=0（全部历史）才含日点。
 func TestRollupIdempotent(t *testing.T) {

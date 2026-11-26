@@ -1552,9 +1552,9 @@ func (p *Panel) syncNicknames() {
 // usage 返回逐请求用量聚合。统计窗口三选一：
 //   - from/to（unix 秒）：显式区间，用于「今天」与「自定义」——区间由浏览器按
 //     本地时区算好再发，服务端时区与浏览器不一致时「今天」才不会被算错；
-//   - hours：滚动窗口（默认 72，上限 1440=60 天），卡片汇总/按域/按账号/按模型/
+//   - hours：滚动窗口（默认 24，上限 1440=60 天），卡片汇总/按域/按账号/按模型/
 //     时序**全部**按该窗口统计；显式 hours=0 表示全部历史（含 90 天前折叠出的日桶）；
-//   - 都不给：等同于 hours=72（保持旧调用方行为）。
+//   - 都不给：等同于 hours=24（保持旧调用方行为）。
 func (p *Panel) usage(w http.ResponseWriter, r *http.Request) {
 	if p.cfg.Usage == nil {
 		writeErr(w, http.StatusNotImplemented, "usage recorder not available")
@@ -1565,7 +1565,7 @@ func (p *Panel) usage(w http.ResponseWriter, r *http.Request) {
 	win.From = parseTimeParam(q.Get("from"))
 	win.To = parseTimeParam(q.Get("to"))
 	if win.From.IsZero() && win.To.IsZero() {
-		win.Hours = 72
+		win.Hours = 24
 		if v := q.Get("hours"); v != "" {
 			if n, err := strconv.Atoi(v); err == nil && n >= 0 {
 				win.Hours = n

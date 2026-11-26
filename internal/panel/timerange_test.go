@@ -51,6 +51,10 @@ func TestUsageHandlerAcceptsExplicitRange(t *testing.T) {
 		rec.Add(base.Add(time.Duration(i)*time.Hour), "cn", "u1", "glm-5.2",
 			usage.Delta{PromptTokens: 10, HasPromptTokens: true}, true)
 	}
+	// 35 小时前的一笔：在小时保留期内，但落在默认窗口（近 24 小时）之外——用来钉住
+	// 「不给参数 = 24 小时」这个默认，而不是只钉住「不给参数会返回点什么」。
+	rec.Add(base.Add(-30*time.Hour), "cn", "u1", "glm-5.2",
+		usage.Delta{PromptTokens: 10, HasPromptTokens: true}, true)
 	p := New(Config{Version: "test", APIKey: "k", Usage: rec, Pool: pool.New("")})
 
 	get := func(query string) map[string]any {
@@ -81,19 +85,19 @@ func TestUsageHandlerAcceptsExplicitRange(t *testing.T) {
 		t.Fatalf("响应应回显 window_from/window_to: %+v", got)
 	}
 
-	// 无区间参数时回落默认 72h，且不回显区间。
+	// 无区间参数时回落默认 24h（35 小时前那笔被排除），且不回显区间。
 	def := get("")
 	if def["window_from"] != nil || def["window_to"] != nil {
 		t.Fatalf("默认窗口不应回显区间: %+v", def)
 	}
 	if r := def["totals"].(map[string]any)["requests"].(float64); r != 6 {
-		t.Fatalf("默认窗口请求数 = %v, want 6", r)
+		t.Fatalf("默认窗口请求数 = %v, want 6（近 24 小时，不含 35 小时前那笔）", r)
 	}
 
 	// hours=0（全部历史）同样不回显区间。
 	all := get("?hours=0")
-	if r := all["totals"].(map[string]any)["requests"].(float64); r != 6 {
-		t.Fatalf("全部历史请求数 = %v, want 6", r)
+	if r := all["totals"].(map[string]any)["requests"].(float64); r != 7 {
+		t.Fatalf("全部历史请求数 = %v, want 7", r)
 	}
 }
 

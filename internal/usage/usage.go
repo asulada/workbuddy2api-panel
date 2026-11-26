@@ -470,6 +470,32 @@ type Point struct {
 	Agg
 }
 
+// AccountPoint 时序点 × 账号：一个时段里单个账号的用量。
+//
+// 「积分与 token 按小时」表此前只有整体口径：多账号轮换时，同一小时里「哪个号在
+// 花钱、哪个号在吃缓存命中」被整体聚合抹平，只能退回全窗口的按账号合计表去猜。
+// 这里按 (scope, uid) 再分一层，前端可以在同一张表里切换整体 / 按账号两个视图。
+//
+// 不落盘：它是 Snapshot 时从已有桶算出来的派生物，与 Series 同源，故不会出现
+// 「总量对不上明细」的两份账。
+type AccountPoint struct {
+	T        string `json:"t"`
+	Scope    string `json:"scope"` // "hour" | "day"
+	UID      string `json:"uid"`
+	Nickname string `json:"nickname,omitempty"`
+	Realm    string `json:"realm,omitempty"`
+	Agg
+}
+
+// acctPointAcc 按 (时段, 账号) 的累加器。
+type acctPointAcc struct {
+	aggAcc
+	UID   string
+	Realm string
+	T     string
+	Scope string
+}
+
 // CreditAgg 积分扣除统计的一行。Key 在账号维度是 UID，在模型维度是「域:模型」
 // （cn:xxx / global:xxx，与 /v1/models 的调用值同形）；行按 (域, 模型, 生效倍率)
 // 分组；Rate 仅模型维度使用；比例分母只统计与 credit 同时存在的 Token 样本。
@@ -515,16 +541,17 @@ func (a *creditAcc) finish() CreditAgg {
 
 // Snapshot 面板一次拉取的全部用量视图数据。
 type Snapshot struct {
-	Totals          Agg         `json:"totals"`
-	ByRealm         []KeyedAgg  `json:"by_realm"`
-	ByAccount       []KeyedAgg  `json:"by_account"`
-	ByModel         []KeyedAgg  `json:"by_model"`
-	Series          []Point     `json:"series"`
-	CreditByAccount []CreditAgg `json:"credit_by_account"`
-	CreditByModel   []CreditAgg `json:"credit_by_model"`
-	Buckets         int         `json:"buckets"`
-	FileBytes       int64       `json:"file_bytes"`
-	Since           string      `json:"since,omitempty"`
+	Totals          Agg            `json:"totals"`
+	ByRealm         []KeyedAgg     `json:"by_realm"`
+	ByAccount       []KeyedAgg     `json:"by_account"`
+	ByModel         []KeyedAgg     `json:"by_model"`
+	Series          []Point        `json:"series"`
+	SeriesByAccount []AccountPoint `json:"series_by_account"`
+	CreditByAccount []CreditAgg    `json:"credit_by_account"`
+	CreditByModel   []CreditAgg    `json:"credit_by_model"`
+	Buckets         int            `json:"buckets"`
+	FileBytes       int64          `json:"file_bytes"`
+	Since           string         `json:"since,omitempty"`
 	// LastError/FailedFlushes 落盘健康观测：失败计数与最近一次错误（面板可显示
 	// 「用量文件已 N 轮没写成功」）；零值省略，健康时不出现。
 	LastError     string `json:"last_error,omitempty"`
@@ -626,6 +653,19 @@ func (r *Recorder) SnapshotWindow(w Window, nicks map[string]string, currentRate
 	modelAgg := map[string]*aggAcc{}
 	hourSeries := map[string]*aggAcc{}
 	daySeries := map[string]*aggAcc{}
+	acctSeries := map[string]*acctPointAcc{}
+	// addAcctPoint 把桶同时记进「时段 × 账号」这一层。key 带 scope 种类，
+	// 免得小时桶与日桶在同一时间串上撞车（"2026-09-16T13" vs "2026-09-16" 本就不同，
+	// 但日桶折叠前后同一时刻可能都出现，靠种类分开更稳）。
+	addAcctPoint := func(kind, t string, b *bucket) {
+		k := kind + "\x00" + t + "\x00" + b.UID
+		a := acctSeries[k]
+		if a == nil {
+			a = &acctPointAcc{UID: b.UID, Realm: b.Realm, T: t, Scope: kind}
+			acctSeries[k] = a
+		}
+		a.add(b)
+	}
 	creditAcctAgg := map[string]*creditAcc{}
 	creditModelAgg := map[string]*creditAcc{}
 	rateCache := map[string]string{}
@@ -681,12 +721,14 @@ func (r *Recorder) SnapshotWindow(w Window, nicks map[string]string, currentRate
 				hourSeries[scope] = &aggAcc{}
 			}
 			hourSeries[scope].add(b)
+			addAcctPoint("hour", scope, b)
 		} else {
 			scope := strings.TrimPrefix(b.Scope, "d:")
 			if daySeries[scope] == nil {
 				daySeries[scope] = &aggAcc{}
 			}
 			daySeries[scope].add(b)
+			addAcctPoint("day", scope, b)
 		}
 		if b.CRN > 0 {
 			ca := creditAcctAgg[b.UID]
@@ -761,6 +803,38 @@ func (r *Recorder) SnapshotWindow(w Window, nicks map[string]string, currentRate
 	sort.Strings(hourKeys)
 	for _, k := range hourKeys {
 		snap.Series = append(snap.Series, Point{T: k, Scope: "hour", Agg: hourSeries[k].finish()})
+	}
+
+	// 「时段 × 账号」点：与 Series 同序（日点在前、小时点在后，各自按时间升序），
+	// 同一时段内按合计 Token 降序——前端按账号视图里同一时段的行连在一起，
+	// 多号集中烧号时最花钱的那个号排最上面。
+	acctKeys := make([]string, 0, len(acctSeries))
+	for k := range acctSeries {
+		acctKeys = append(acctKeys, k)
+	}
+	sort.Slice(acctKeys, func(i, j int) bool {
+		a, b := acctSeries[acctKeys[i]], acctSeries[acctKeys[j]]
+		if a.Scope != b.Scope {
+			return a.Scope == "day" // 日点在前，与 Series 的口径一致
+		}
+		if a.T != b.T {
+			return a.T < b.T
+		}
+		if a.TotalTokens != b.TotalTokens {
+			return a.TotalTokens > b.TotalTokens
+		}
+		return a.UID < b.UID
+	})
+	for _, k := range acctKeys {
+		a := acctSeries[k]
+		snap.SeriesByAccount = append(snap.SeriesByAccount, AccountPoint{
+			T:        a.T,
+			Scope:    a.Scope,
+			UID:      a.UID,
+			Nickname: nicks[a.UID],
+			Realm:    a.Realm,
+			Agg:      a.finish(),
+		})
 	}
 
 	if r.path != "" {

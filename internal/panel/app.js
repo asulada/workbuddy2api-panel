@@ -176,7 +176,9 @@ const TRANGE_PRESETS = [
   ['0', '全部历史'],
   ['custom', '自定义…'],
 ];
-const TRANGE_DEFAULT = '72';
+// 用量页默认「近 24 小时」：一天的完整昼夜最容易看出用量峰谷，也避免一打开就
+// 拉三天时序。归档页自己 trangeBind 时显式传 '0'（全部历史），不跟着变。
+const TRANGE_DEFAULT = '24';
 const trangeStates = new Map(); // hostId → { preset, from: Date|null, to: Date|null }
 
 // dtLocalValue / dtLocalParse 与 <input type=datetime-local> 的取值格式互转
@@ -264,8 +266,8 @@ function trangeEmit(id) {
 // trangeQuery 把当前选择翻译成查询参数。
 //   rolling=true  → 滚动预设发 hours（服务端整点对齐），今天/自定义发 from/to
 //   rolling=false → 一律发 from/to（归档是线性日志，前端算区间更直观）。
-// 「全部历史」：**用量**必须显式发 hours=0 —— 服务端「不给参数」的默认是 72 小时，
-// 空查询会让「全部历史」静默变成「近 3 天」（issue #121 的形态：全部历史 8903 次请求
+// 「全部历史」：**用量**必须显式发 hours=0 —— 服务端「不给参数」的默认是 24 小时，
+// 空查询会让「全部历史」静默变成「近 24 小时」（issue #121 的形态：全部历史 8903 次请求
 // 与近 3 天一模一样，而真全部历史是 24817 次）。归档接口不认 hours，保持空查询
 // （它的默认是「最近 N 条」，本身就是全量日志的最新一段）。
 function trangeQuery(id, rolling) {
@@ -3536,7 +3538,7 @@ function renderUsage(d) {
   renderUsageDim();
   renderCreditDim();
   renderUsageChart(usageData.series || []);
-  renderUsageHours(usageData.series || []);
+  renderUsageHours(usageData);
 }
 
 // 维度切换 / 排序控件。
@@ -3551,6 +3553,14 @@ if ($('usCreditTabs')) $('usCreditTabs').addEventListener('click', ev => {
   if (!b) return;
   usCreditDim = b.dataset.dim;
   renderCreditDim();
+});
+// 「按小时」表的整体 / 按账号切换：只换渲染口径，不重新请求（同一份快照里两套数据都有）。
+if ($('usHourTabs')) $('usHourTabs').addEventListener('click', ev => {
+  const b = ev.target.closest('button[data-dim]');
+  if (!b) return;
+  usHourDim = b.dataset.dim;
+  $('usHourTabs').querySelectorAll('button').forEach(x => x.classList.toggle('on', x === b));
+  renderUsageHours(usageData || {});
 });
 if ($('usSort')) $('usSort').onchange = () => {
   usSort = $('usSort').value;
@@ -3574,34 +3584,79 @@ if ($('usSort')) $('usSort').onchange = () => {
  * 与 hour 点在同一个连续轴上——日桶本来就是他那天所有小时的聚合。
  */
 
-/* renderUsageHours 填「积分与 token 按小时」表：直接消费 series 时序点（hour 点
-   一小时一行、day 点一行代表当天聚合），最新时段排在最上面。此前这张表只有静态
-   表头、没有任何渲染代码，用户永远看到一张空表。token/积分 = 合计 Token ÷ 该时段
-   实测扣除积分（兑换率），没有积分样本的时段留 —，不拿 0 顶替。 */
-function renderUsageHours(series) {
+/* renderUsageHours 填「积分与 token 按小时」表。两个视图共用一张表、零请求切换：
+   整体视图吃 series（hour 点一小时一行、day 点一行代表当天聚合）；按账号视图吃
+   series_by_account（同一时段里每个账号各占一行，带账号名与域）。此前这张表只有
+   静态表头、没有任何渲染代码，用户永远看到一张空表。
+   token/积分 = 合计 Token ÷ 该时段实测扣除积分（兑换率），没有积分样本的时段留 —，
+   不拿 0 顶替。 */
+let usHourDim = 'total';
+
+function renderUsageHours(d) {
   const body = $('usHourBody');
   if (!body) return;
-  const rows = [];
-  for (const p of (series || [])) {
-    if (parsePointTime(p) !== null) rows.push(p);
+  const byAcct = usHourDim === 'account';
+  const head = $('usHourHead');
+  if (head) {
+    head.innerHTML = '<tr><th class="mark" aria-hidden="true"></th><th>时段</th>' +
+      (byAcct ? '<th>账号</th>' : '') +
+      '<th class="num">请求</th><th class="num">Prompt</th><th class="num">Completion</th>' +
+      '<th class="num">合计</th><th class="num">积分</th><th class="num">token/积分</th></tr>';
   }
-  // 最新时段排最上面。后端 series 是「日桶升序 + 小时桶升序」两段拼接，简单 reverse
-  // 对混合窗口会错序，直接按时间戳降序排，与输入顺序解耦。
+  const rows = byAcct
+    ? usHourAccountRows((d && d.series_by_account) || [])
+    : usHourSeriesRows((d && d.series) || []);
+  body.innerHTML = rows.map(p => usHourRow(p, byAcct)).join('') ||
+    '<tr><td colspan="' + (byAcct ? 9 : 8) + '" class="empty">暂无数据</td></tr>';
+}
+
+/* usHourSeriesRows 整体视图的行：丢掉时间解析不出来的点，再按时间降序。
+   后端 series 是「日桶升序 + 小时桶升序」两段拼接，简单 reverse 对混合窗口会错序，
+   直接按时间戳降序排，与输入顺序解耦。 */
+function usHourSeriesRows(series) {
+  const rows = [];
+  for (const p of series) {
+    if (p && typeof p.t === 'string' && parsePointTime(p) !== null) rows.push(p);
+  }
   rows.sort((a, b) => parsePointTime(b) - parsePointTime(a));
-  body.innerHTML = rows.map(p => {
-    const tt = Number(p.total_tokens || 0);
-    const cr = Number(p.credits || 0);
-    return '<tr>' +
-      '<td class="mark" aria-hidden="true"></td>' +
-      '<td>' + esc(usHourLabel(p)) + '</td>' +
-      '<td class="num">' + fmtTok(p.requests) + '</td>' +
-      '<td class="num">' + fmtTok(p.prompt_tokens) + '</td>' +
-      '<td class="num">' + fmtTok(p.completion_tokens) + '</td>' +
-      '<td class="num">' + fmtTok(p.total_tokens) + '</td>' +
-      '<td class="num">' + (cr ? fmtCredit(p.credits) : '—') + '</td>' +
-      '<td class="num">' + (cr > 0 && tt > 0 ? fmtTok(tt / cr) : '—') + '</td>' +
-      '</tr>';
-  }).join('') || '<tr><td colspan="8" class="empty">暂无数据</td></tr>';
+  return rows;
+}
+
+/* usHourAccountRows 按账号视图的行：时段降序；同一时段内按合计 Token 降序——
+   多号集中烧号时，那一组里最花钱的号排最上面。 */
+function usHourAccountRows(points) {
+  const rows = [];
+  for (const p of points) {
+    if (p && typeof p.t === 'string' && parsePointTime(p) !== null) rows.push(p);
+  }
+  rows.sort((a, b) => (parsePointTime(b) - parsePointTime(a)) ||
+    (Number(b.total_tokens || 0) - Number(a.total_tokens || 0)));
+  return rows;
+}
+
+/* usHourRow 一行。byAcct 时多一列账号：昵称优先，缺省取 uid 前 8 位，下行小字补
+   域与 uid——与「积分扣除·按账号」表同一套写法，页面之间认人的方式要一致。 */
+function usHourRow(p, byAcct) {
+  const tt = Number(p.total_tokens || 0);
+  const cr = Number(p.credits || 0);
+  let acctCell = '';
+  if (byAcct) {
+    const uid = String(p.uid || '');
+    const name = p.nickname || uid.slice(0, 8) || '—';
+    acctCell = '<td>' + remarkName(uid, esc(name)) +
+      '<div class="note">' + esc(p.realm || '') + ' · ' + esc(uid.slice(0, 8)) + '</div></td>';
+  }
+  return '<tr>' +
+    '<td class="mark" aria-hidden="true"></td>' +
+    '<td>' + esc(usHourLabel(p)) + '</td>' +
+    acctCell +
+    '<td class="num">' + fmtTok(p.requests) + '</td>' +
+    '<td class="num">' + fmtTok(p.prompt_tokens) + '</td>' +
+    '<td class="num">' + fmtTok(p.completion_tokens) + '</td>' +
+    '<td class="num">' + fmtTok(p.total_tokens) + '</td>' +
+    '<td class="num">' + (cr ? fmtCredit(p.credits) : '—') + '</td>' +
+    '<td class="num">' + (cr > 0 && tt > 0 ? fmtTok(tt / cr) : '—') + '</td>' +
+    '</tr>';
 }
 
 /* usHourLabel 时段列的完整标签：小时桶「MM-DD HH:00」（跨天窗口下只有 HH:00 分不清
